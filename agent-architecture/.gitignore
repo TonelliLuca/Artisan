@@ -5,6 +5,12 @@ build/
 !**/src/test/**/build/
 .kotlin
 
+### Gradle Wrapper ###
+!gradle/
+!gradle/wrapper/
+!gradlew
+!gradlew.bat
+
 ### IntelliJ IDEA ###
 .idea/modules.xml
 .idea/jarRepositories.xml
