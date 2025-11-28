@@ -1,6 +1,6 @@
-# tesi
+# Artisan
 
-## Quick test (English)
+## Quick test 
 
 Prerequisites:
 - Node.js (>=16) and npm
