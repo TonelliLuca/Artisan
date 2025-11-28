@@ -1,0 +1,21 @@
+{
+  "name": "mcp_asyn_tool_node",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node async-mcp-server.js",
+    "timer": "node timer-tool2.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.23.0",
+    "express": "^5.1.0",
+    "zod": "^3.25.76",
+    "zod-to-json-schema": "^3.23.2"
+  }
+}
