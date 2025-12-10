@@ -15,6 +15,9 @@ public interface ReactBrain {
         Context: {{context}}
 
         Think step-by-step and output a structured reasoning result.
+   
+        Rules:
+            - NEVER call tools in this phase.
     """)
     String reason(@V("goal")String goal, @V("lastStep")String lastStep, @V("context")String context);
 
