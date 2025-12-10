@@ -26,8 +26,8 @@ public class Activity {
         this.status = Status.REASONING;
     }
 
-    public UUID getUuid() {
-        return uuid;
+    public String getUuid() {
+        return uuid.toString();
     }
 
     public String getGoal() {

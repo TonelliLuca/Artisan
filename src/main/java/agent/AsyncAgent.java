@@ -1,4 +1,5 @@
 package agent;
+
 import agent.activity.Activity;
 import agent.activity.ReasoningStep;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -19,6 +20,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -26,6 +28,7 @@ import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 public class AsyncAgent<T extends ReactBrain> {
     private final OpenAiChatModel model;
@@ -37,8 +40,8 @@ public class AsyncAgent<T extends ReactBrain> {
     private final Logger logger = LoggerFactory.getLogger(AsyncAgent.class);
 
     private final ObjectMapper objectMapper = new ObjectMapper();
-    private final Map<String, JsonNode> variables = new ConcurrentHashMap<>();
-    private final List<JsonNode> events = new CopyOnWriteArrayList<>();
+    private final Map<String, Map<String, JsonNode>> variablesPerActivity = new ConcurrentHashMap<>();
+    private final Map<String, List<JsonNode>> eventsPerActivity = new ConcurrentHashMap<>();
 
     private final String sseUrl;
 
@@ -84,7 +87,6 @@ public class AsyncAgent<T extends ReactBrain> {
     }
 
 
-    // Modified eventLoop() in src/main/java/agent/AsyncAgent.java
     private void eventLoop() {
         logger.info("🚦 Agent event loop started");
         while (loopRunning.get() && !Thread.currentThread().isInterrupted()) {
@@ -101,11 +103,15 @@ public class AsyncAgent<T extends ReactBrain> {
 
                 // prepare lastStep and context payloads expected by ReactBrain methods
                 String lastStepJson = activity.lastStep().map(ReasoningStep::toJson).orElse("");
+                // compute activityUuid early so snapshots can be tied to the correct activity
+                String activityUuid = activity.getUuid().toString();
                 String contextJson;
                 try {
                     Map<String, Object> ctx = new HashMap<>();
-                    ctx.put("variables", snapshotVariables()); // copy of current variables
-                    ctx.put("events", events); // current events list (JsonNode)
+                    // include the activity UUID so tools can correlate calls; also provide a per-activity variables/events window
+                    ctx.put("activityUuid", activityUuid);
+                    ctx.put("variables", snapshotVariables(activityUuid)); // variables scoped to this activity
+                    ctx.put("events", eventsPerActivity.getOrDefault(activityUuid, Collections.emptyList()));
                     contextJson = objectMapper.writeValueAsString(ctx);
                 } catch (Exception e) {
                     logger.debug("Failed to serialize context, using empty context", e);
@@ -115,7 +121,7 @@ public class AsyncAgent<T extends ReactBrain> {
                 switch (status) {
                     case REASONING -> {
                         String reasoningResult = invokeAgentMethod("reason", activity.getGoal(), lastStepJson, contextJson);
-                        Map<String, Object> snapshot = snapshotVariables();
+                        Map<String, Object> snapshot = snapshotVariables(activityUuid);
                         activity.addStep(new ReasoningStep("reason", activity.getGoal(), reasoningResult, snapshot));
                         activity.setStatus(Activity.Status.ACTION);
                         logger.info("Activity {} moved to ACTION", activity.getUuid());
@@ -123,14 +129,14 @@ public class AsyncAgent<T extends ReactBrain> {
                     case ACTION -> {
                         // Tools / external calls should only happen in ACTION.
                         String actionResult = invokeAgentMethod("act", activity.getGoal(), lastStepJson, contextJson);
-                        Map<String, Object> snapshot = snapshotVariables();
+                        Map<String, Object> snapshot = snapshotVariables(activityUuid);
                         activity.addStep(new ReasoningStep("act", activity.getGoal(), actionResult, snapshot));
                         activity.setStatus(Activity.Status.OBSERVATION);
                         logger.info("Activity {} moved to OBSERVATION", activity.getUuid());
                     }
                     case OBSERVATION -> {
                         String obsResult = invokeAgentMethod("observe", activity.getGoal(), lastStepJson, contextJson);
-                        Map<String, Object> snapshot = snapshotVariables();
+                        Map<String, Object> snapshot = snapshotVariables(activityUuid);
                         activity.addStep(new ReasoningStep("observe", activity.getGoal(), obsResult, snapshot));
 
                         boolean completed = parseCompleted(obsResult);
@@ -181,15 +187,17 @@ public class AsyncAgent<T extends ReactBrain> {
         return s.contains("completed") || s.equals("done") || s.equals("success") || s.equals("goal achieved");
     }
 
-    // Snapshot variables converting JsonNode values to Object
-    private Map<String, Object> snapshotVariables() {
+    // Snapshot variables converting JsonNode values to Object for a specific activity UUID
+    private Map<String, Object> snapshotVariables(String activityUuid) {
         Map<String, Object> snapshot = new HashMap<>();
-        variables.forEach(snapshot::put);
+        if (activityUuid == null) return snapshot;
+        Map<String, JsonNode> vars = variablesPerActivity.get(activityUuid);
+        if (vars == null) return snapshot;
+        vars.forEach((k, v) -> snapshot.put(k, v));
         return snapshot;
     }
 
     // Reflectively invoke a method on the agentBrain if available: reason / act / observe
-
     private String invokeAgentMethod(String methodName, Object... args) {
         try {
             Method target = null;
@@ -236,7 +244,6 @@ public class AsyncAgent<T extends ReactBrain> {
         }
     }
 
-
     public void shutdown() {
         loopRunning.set(false);
         executor.shutdownNow();
@@ -268,7 +275,6 @@ public class AsyncAgent<T extends ReactBrain> {
         }));
     }
 
-
     private void handleMcpEvent(String json) {
         try {
             JsonNode root = objectMapper.readTree(json);
@@ -281,6 +287,9 @@ public class AsyncAgent<T extends ReactBrain> {
 
             if ("variable".equalsIgnoreCase(mcpType)) {
 
+                // determine message uuid (which should have been provided by the tool)
+                String msgUuid = params.has("uuid") ? params.get("uuid").asText() : "global";
+
                 // support both "name" and "key" as the variable identifier
                 String name = null;
                 if (params.has("name")) name = params.get("name").asText();
@@ -289,13 +298,15 @@ public class AsyncAgent<T extends ReactBrain> {
 
                 JsonNode value = params.has("value") ? params.get("value") : NullNode.getInstance();
 
-                variables.put(name, value);
-                logger.info("🔁 Variable stored/updated: {} -> {}", name, value);
+                variablesPerActivity.computeIfAbsent(msgUuid, k -> new ConcurrentHashMap<>()).put(name, value);
+
+                logger.info("🔁 Variable stored/updated for uuid {}: {} -> {}", msgUuid, name, value);
 
                 return;
             }
 
             if ("event".equalsIgnoreCase(mcpType)) {
+                String msgUuid = params.has("uuid") ? params.get("uuid").asText() : "global";
                 JsonNode eventPayload = null;
                 if (params.has("payload")) eventPayload = params.get("payload");
                 else if (params.has("event")) eventPayload = params.get("event");
@@ -305,8 +316,9 @@ public class AsyncAgent<T extends ReactBrain> {
                     eventPayload = eventPayload.get("event");
                 }
 
-                events.add(eventPayload);
-                logger.info("📥 Event stored: {}", eventPayload);
+                eventsPerActivity.computeIfAbsent(msgUuid, k -> new CopyOnWriteArrayList<>()).add(eventPayload);
+
+                logger.info("📥 Event stored for uuid {}: {}", msgUuid, eventPayload);
 
                 return;
             }
@@ -317,8 +329,6 @@ public class AsyncAgent<T extends ReactBrain> {
             logger.error("Failed to handle MCP event", e);
         }
     }
-
-
 
     public T brain() {
         return agentBrain;
