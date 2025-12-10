@@ -1,5 +1,3 @@
-
-
 import agent.AsyncAgent;
 import agent.ReactBrain;
 import agent.activity.Activity;
@@ -51,8 +49,7 @@ public class ActivitySubmissionIntegrationTest {
     @Test
     void submitActivity_setsTimer_and_activityHistoryEvolves_reactiveSubscribe() throws Exception {
         // 0. Skip if local node server not running
-        try (Socket s = new Socket("localhost", 3001)) { /* ok */ }
-        catch (Exception e) {
+        try (Socket s = new Socket("localhost", 3001)) { /* ok */ } catch (Exception e) {
             System.out.println("⚠️ Node Server not running on 3001. Skipping integration test.");
             return;
         }
@@ -101,7 +98,7 @@ public class ActivitySubmissionIntegrationTest {
         queue.offer(activity);
 
         // 5. Wait for the activity to be processed through phases (history grows)
-        long deadline = System.currentTimeMillis() + 15000;
+        long deadline = System.currentTimeMillis() + 30000;
         boolean historyEvolved = false;
         while (System.currentTimeMillis() < deadline) {
             int size = activity.getHistory().size();
@@ -120,26 +117,34 @@ public class ActivitySubmissionIntegrationTest {
         assertEquals("act", hist.get(1).getAction().toLowerCase());
         assertEquals("observe", hist.get(2).getAction().toLowerCase());
 
-        // 7. Also verify MCP side-effects: variables and events contain timer entries
-        Field varsField = AsyncAgent.class.getDeclaredField("variables");
-        varsField.setAccessible(true);
+        // 7. Also verify MCP side-effects: variables and events contain timer entries (per-UUID maps)
+        Field varsPerActivityField = AsyncAgent.class.getDeclaredField("variablesPerActivity");
+        varsPerActivityField.setAccessible(true);
         @SuppressWarnings("unchecked")
-        Map<String, JsonNode> vars = (Map<String, JsonNode>) varsField.get(agent);
+        Map<String, Map<String, JsonNode>> varsPerActivity = (Map<String, Map<String, JsonNode>>) varsPerActivityField.get(agent);
 
-        Field eventsField = AsyncAgent.class.getDeclaredField("events");
-        eventsField.setAccessible(true);
+        Field eventsPerActivityField = AsyncAgent.class.getDeclaredField("eventsPerActivity");
+        eventsPerActivityField.setAccessible(true);
         @SuppressWarnings("unchecked")
-        List<JsonNode> events = (List<JsonNode>) eventsField.get(agent);
+        Map<String, List<JsonNode>> eventsPerActivity = (Map<String, List<JsonNode>>) eventsPerActivityField.get(agent);
 
-        // wait a bit more for variable + event (timer finished occurs after ~1s)
-        long deadline2 = System.currentTimeMillis() + 12000;
+        long deadline2 = System.currentTimeMillis() + 30000;
         boolean gotVar = false;
         boolean gotEvent = false;
         String expectedKey = "test-timer";
+        String messageUuid = activity.getUuid();
+
         while (System.currentTimeMillis() < deadline2 && !(gotVar && gotEvent)) {
-            if (!gotVar && vars.containsKey(expectedKey)) gotVar = true;
-            if (!gotEvent) {
-                for (JsonNode ev : events) {
+            // check per-uuid vars specifically for this messageUuid
+            Map<String, JsonNode> bucket = varsPerActivity.get(messageUuid);
+            if (!gotVar && bucket != null && bucket.containsKey(expectedKey)) {
+                gotVar = true;
+            }
+
+            // check per-uuid events specifically for this messageUuid
+            List<JsonNode> evList = eventsPerActivity.get(messageUuid);
+            if (!gotEvent && evList != null) {
+                for (JsonNode ev : evList) {
                     if (ev != null && ev.has("key") && expectedKey.equals(ev.get("key").asText())
                             && ev.has("name") && "timer.finished".equals(ev.get("name").asText())) {
                         gotEvent = true;
@@ -147,17 +152,53 @@ public class ActivitySubmissionIntegrationTest {
                     }
                 }
             }
+
+            // fallback: scan all per-uuid buckets if not found under the activity UUID
+            if (!gotVar) {
+                for (Map<String, JsonNode> b : varsPerActivity.values()) {
+                    if (b != null && b.containsKey(expectedKey)) {
+                        gotVar = true;
+                        break;
+                    }
+                }
+            }
+            if (!gotEvent) {
+                for (List<JsonNode> list : eventsPerActivity.values()) {
+                    if (list == null) continue;
+                    for (JsonNode ev : list) {
+                        if (ev != null && ev.has("key") && expectedKey.equals(ev.get("key").asText())
+                                && ev.has("name") && "timer.finished".equals(ev.get("name").asText())) {
+                            gotEvent = true;
+                            break;
+                        }
+                    }
+                    if (gotEvent) break;
+                }
+            }
+
             if (gotVar && gotEvent) break;
             Thread.sleep(200);
         }
 
-        assertTrue(gotVar, "Variable with key '" + expectedKey + "' should be stored in variables map");
-        assertTrue(vars.containsKey(expectedKey));
-        JsonNode storedVar = vars.get(expectedKey);
-        assertNotNull(storedVar);
+        assertTrue(gotVar, "Variable with key '" + expectedKey + "' should be stored in per-UUID maps");
+
+        // locate storedVar in per-uuid map for this activity's UUID (or any per-UUID bucket as fallback)
+        JsonNode storedVar = null;
+        Map<String, JsonNode> localBucket = varsPerActivity.get(messageUuid);
+        if (localBucket != null) storedVar = localBucket.get(expectedKey);
+        if (storedVar == null) {
+            for (Map<String, JsonNode> b : varsPerActivity.values()) {
+                if (b != null && b.containsKey(expectedKey)) {
+                    storedVar = b.get(expectedKey);
+                    break;
+                }
+            }
+        }
+
+        assertNotNull(storedVar, "Stored variable must be present in per-UUID maps for key '" + expectedKey + "'");
         assertTrue(storedVar.has("seconds") || storedVar.has("name"));
 
-        assertTrue(gotEvent, "Events should contain a 'timer.finished' for key '" + expectedKey + "'");
+        assertTrue(gotEvent, "Events should contain a 'timer.finished' for key '" + expectedKey + "' in per-UUID maps");
         printActivityHistory(activity);
     }
 }

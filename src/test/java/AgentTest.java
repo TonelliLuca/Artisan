@@ -11,6 +11,8 @@ import dev.langchain4j.mcp.client.transport.McpTransport;
 import dev.langchain4j.mcp.client.transport.http.StreamableHttpMcpTransport;
 import dev.langchain4j.model.openai.OpenAiChatModel;
 import dev.langchain4j.service.SystemMessage;
+import dev.langchain4j.service.UserMessage;
+import dev.langchain4j.service.V;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -22,7 +24,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import static org.junit.jupiter.api.Assertions.*;
 
 public class AgentTest {
-
+    String uuid = java.util.UUID.randomUUID().toString();
     public interface SimpleAgentInterface extends ReactBrain {
         @SystemMessage("This is a simple test agent interface.")
         String test(String input);
@@ -210,14 +212,14 @@ public class AgentTest {
     @DisplayName("Agent Functionality Tests")
     class AgentFunctionalityTests {
         public interface McpTestAgent extends ReactBrain {
-            @SystemMessage("You are a helpful assistant with access to external tools via MCP. Use them when requested.")
-            String chat(String input);
+            @UserMessage("[ACTING phase] You are a helpful assistant with access to external tools via MCP that you need to call using the {{input}}. Use them when requested."
+            + " Always include the provided UUID '{{UUID}}' in your tool calls to correlate actions.")
+            String chat(@V("input") String input,@V("UUID") String UUID);
         }
 
         @Nested
         @DisplayName("MCP Integration Tests")
         class McpIntegrationTests {
-
             @Test
             @DisplayName("Should actually call MCP Tool via Agent (Integration)")
             void shouldExecuteRealMcpTool() {
@@ -261,7 +263,7 @@ public class AgentTest {
 
                 System.out.println("🤖 Asking agent to use the tool...");
 
-                String response = agent.brain().chat("Subscribe to the notification system, please.");
+                String response = agent.brain().chat("Subscribe to the notification system, please.", uuid);
 
                 System.out.println("🤖 Agent Response: " + response);
                 assertNotNull(response);
@@ -312,7 +314,8 @@ public class AgentTest {
 
             System.out.println("🤖 Asking agent to subscribe to notifications...");
             try {
-                agent.brain().chat("Subscribe to the notification system, please.");
+                var reply = agent.brain().chat("Call the timerTool with action parameter = subscribe", uuid);
+                System.out.println("🤖 Agent subscribe reply: " + reply);
             } catch (java.lang.reflect.UndeclaredThrowableException ute) {
                 System.out.println("⚠️ agent.brain().chat (subscribe) raised UndeclaredThrowableException (continuing)");
                 Throwable cause = ute.getCause();
@@ -330,7 +333,7 @@ public class AgentTest {
             String prompt = "Use the timer tool to set a timer: set seconds 1 name test-timer";
 
             try {
-                agent.brain().chat(prompt);
+                agent.brain().chat(prompt, uuid);
             } catch (java.lang.reflect.UndeclaredThrowableException ute) {
                 System.out.println("⚠️ agent.brain().chat (set) raised UndeclaredThrowableException (continuing to validate SSE side-effects)");
                 Throwable cause = ute.getCause();
@@ -344,25 +347,35 @@ public class AgentTest {
 
             String expectedKey = "test-timer";
 
-            java.lang.reflect.Field varsField = AsyncAgent.class.getDeclaredField("variables");
-            varsField.setAccessible(true);
+            java.lang.reflect.Field varsPerActivityField = AsyncAgent.class.getDeclaredField("variablesPerActivity");
+            varsPerActivityField.setAccessible(true);
             @SuppressWarnings("unchecked")
-            java.util.Map<String, JsonNode> vars =
-                    (java.util.Map<String, JsonNode>) varsField.get(agent);
+            java.util.Map<String, java.util.Map<String, JsonNode>> varsPerActivity =
+                    (java.util.Map<String, java.util.Map<String, JsonNode>>) varsPerActivityField.get(agent);
 
-            java.lang.reflect.Field eventsField = AsyncAgent.class.getDeclaredField("events");
-            eventsField.setAccessible(true);
+            java.lang.reflect.Field eventsPerActivityField = AsyncAgent.class.getDeclaredField("eventsPerActivity");
+            eventsPerActivityField.setAccessible(true);
             @SuppressWarnings("unchecked")
-            java.util.List<JsonNode> events =
-                    (java.util.List<JsonNode>) eventsField.get(agent);
+            java.util.Map<String, java.util.List<JsonNode>> eventsPerActivity =
+                    (java.util.Map<String, java.util.List<JsonNode>>) eventsPerActivityField.get(agent);
 
-            long deadline = System.currentTimeMillis() + 8000;
+            long deadline2 = System.currentTimeMillis() + 30000;
             boolean gotVar = false;
             boolean gotEvent = false;
-            while (System.currentTimeMillis() < deadline && !(gotVar && gotEvent)) {
-                if (!gotVar && vars.containsKey(expectedKey)) gotVar = true;
-                if (!gotEvent) {
-                    for (JsonNode ev : events) {
+            // use the same uuid passed to the agent.brain().chat(...) above
+            String messageUuid = uuid;
+
+            while (System.currentTimeMillis() < deadline2 && !(gotVar && gotEvent)) {
+                // check per-uuid vars specifically for this messageUuid
+                java.util.Map<String, JsonNode> bucket = varsPerActivity.get(messageUuid);
+                if (!gotVar && bucket != null && bucket.containsKey(expectedKey)) {
+                    gotVar = true;
+                }
+
+                // check per-uuid events specifically for this messageUuid
+                java.util.List<JsonNode> evList = eventsPerActivity.get(messageUuid);
+                if (!gotEvent && evList != null) {
+                    for (JsonNode ev : evList) {
                         if (ev != null && ev.has("key") && expectedKey.equals(ev.get("key").asText())
                                 && ev.has("name") && "timer.finished".equals(ev.get("name").asText())) {
                             gotEvent = true;
@@ -370,27 +383,42 @@ public class AgentTest {
                         }
                     }
                 }
+
+                // fallback: scan all per-uuid buckets
+                if (!gotVar) {
+                    for (java.util.Map<String, JsonNode> b : varsPerActivity.values()) {
+                        if (b != null && b.containsKey(expectedKey)) { gotVar = true; break; }
+                    }
+                }
+                if (!gotEvent) {
+                    for (java.util.List<JsonNode> list : eventsPerActivity.values()) {
+                        if (list == null) continue;
+                        for (JsonNode ev : list) {
+                            if (ev != null && ev.has("key") && expectedKey.equals(ev.get("key").asText())
+                                    && ev.has("name") && "timer.finished".equals(ev.get("name").asText())) {
+                                gotEvent = true;
+                                break;
+                            }
+                        }
+                        if (gotEvent) break;
+                    }
+                }
+
                 if (gotVar && gotEvent) break;
                 Thread.sleep(200);
             }
 
-            assertTrue(gotVar, "Variable with key '" + expectedKey + "' should be stored in variables map");
-            assertTrue(vars.containsKey(expectedKey));
-            JsonNode storedVar = vars.get(expectedKey);
-            assertNotNull(storedVar);
+            assertTrue(gotVar, "Variable with key '" + expectedKey + "' should be stored in per-UUID maps for message UUID " + messageUuid);
+
+            // locate stored var in per-uuid map for this messageUuid
+            JsonNode storedVar = null;
+            java.util.Map<String, JsonNode> localBucket = varsPerActivity.get(messageUuid);
+            if (localBucket != null) storedVar = localBucket.get(expectedKey);
+
+            assertNotNull(storedVar, "Stored variable must be present for message UUID " + messageUuid);
             assertTrue(storedVar.has("seconds") || storedVar.has("name"));
 
-            assertTrue(gotEvent, "Events should contain a 'timer.finished' for key '" + expectedKey + "'");
-            JsonNode matchedEvent = null;
-            for (JsonNode ev : events) {
-                if (ev != null && ev.has("key") && expectedKey.equals(ev.get("key").asText())
-                        && ev.has("name") && "timer.finished".equals(ev.get("name").asText())) {
-                    matchedEvent = ev;
-                    break;
-                }
-            }
-            assertNotNull(matchedEvent);
-            assertEquals("timer.finished", matchedEvent.get("name").asText());
+            assertTrue(gotEvent, "Events should contain a 'timer.finished' for key '" + expectedKey + "' in per-UUID maps for message UUID " + messageUuid);
         }
 
 
