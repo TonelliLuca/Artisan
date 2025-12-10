@@ -1,4 +1,4 @@
-// File: src/mcp/timer-tool2.js
+
 import express from 'express';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -9,13 +9,48 @@ const app = express();
 app.use(express.json());
 
 let sseResponse = null;
-let subscribed = false;
-const timers = new Map(); // id -> { name, timeoutId, seconds }
+// track subscriptions per UUID (RFC4122 string)
+const subscribedUuids = new Set();
+// queue notifications per-UUID while SSE is not connected
+const pendingNotifications = new Map();
+// timers map: id -> { name, timeoutId, seconds }
+const timers = new Map();
 
 const server = new McpServer({
     name: 'timer-server',
     version: '1.0.0'
 });
+
+function now() {
+    return new Date().toISOString();
+}
+
+function log(...args) {
+    console.log(now(), ...args);
+}
+
+// helper to enqueue a notification string for a uuid
+function enqueueNotification(uuid, payload) {
+    if (!pendingNotifications.has(uuid)) pendingNotifications.set(uuid, []);
+    pendingNotifications.get(uuid).push(payload);
+}
+
+// flush pending notifications for all subscribed UUIDs (called when SSE connects)
+function flushPendingNotifications() {
+    if (!sseResponse) return;
+    for (const [uuid, list] of pendingNotifications.entries()) {
+        if (!subscribedUuids.has(uuid)) continue; // only deliver for explicitly subscribed UUIDs
+        for (const payload of list) {
+            log('[SSE][FLUSH] Sending queued payload for UUID:', uuid);
+            try {
+                sseResponse.write(`data: ${payload}\n\n`);
+            } catch (e) {
+                log('[SSE][FLUSH] Failed to write payload for UUID', uuid, e);
+            }
+        }
+        pendingNotifications.delete(uuid);
+    }
+}
 
 // -------------------------
 // TOOL
@@ -25,19 +60,41 @@ server.tool(
     {
         action: z.enum(["subscribe", "set"]),
         seconds: z.number().optional(),
-        name: z.string().optional()
+        name: z.string().optional(),
+        uuid: z.string().uuid()
     },
-    async ({ action, seconds, name }) => {
+    async ({ action, seconds, name, uuid }) => {
+
+        log('[TOOL] Called timerTool', { action, seconds, name, uuid, sseConnected: !!sseResponse, subscribedForUuid: subscribedUuids.has(uuid) });
 
         // -------------------------
         // SUBSCRIBE
         // -------------------------
         if (action === "subscribe") {
-            if (!sseResponse) {
-                return { content: [{ type: 'text', text: "⚠️ SSE not connected. Start /sse from the client first." }] };
+            // Always record the subscription intent for this uuid.
+            subscribedUuids.add(uuid);
+            log('[TOOL][SUBSCRIBE] UUID subscribed:', uuid, 'sseConnected=', !!sseResponse);
+
+            // If SSE is connected, acknowledge via SSE too (and flush any queued notifications)
+            const msg = { uuid, content: [{ type: 'text', text: "✅ Subscription activated. You will receive events and variables via SSE." }] };
+            if (sseResponse) {
+                const payload = JSON.stringify({
+                    jsonrpc: "2.0",
+                    method: "notifications/message",
+                    params: { uuid, mcpType: "event", event: { key: "subscription", name: "subscription.activated", message: "Subscription active" } }
+                });
+                try {
+                    sseResponse.write(`data: ${payload}\n\n`);
+                } catch (e) {
+                    log('[TOOL][SUBSCRIBE] Failed to write SSE ack for UUID', uuid, e);
+                }
+                // flush any pending notifications for this uuid
+                flushPendingNotifications();
+            } else {
+                log('[TOOL][SUBSCRIBE] SSE not connected; subscription recorded for UUID', uuid);
             }
-            subscribed = true;
-            return { content: [{ type: 'text', text: "✅ Subscription activated. You will receive events/variables." }] };
+
+            return msg;
         }
 
         // -------------------------
@@ -45,30 +102,48 @@ server.tool(
         // -------------------------
         if (action === "set") {
             if (!seconds) {
-                return { content: [{ type: 'text', text: "❌ Error: missing seconds." }] };
+                log('[TOOL][SET] Error: missing seconds. UUID:', uuid);
+                return { uuid, content: [{ type: 'text', text: "❌ Error: missing seconds." }] };
             }
 
             const id = name ? String(name) : `timer-${randomUUID()}`;
-            console.log(`[NODE] Timer ${id} set for ${seconds}s`);
+            log('[TOOL][SET] Timer set', { id, seconds, uuid });
 
             const timeoutId = setTimeout(() => {
-                console.log(`[NODE] Timer ${id} EXPIRED → sending event`);
+                log('[NODE] Timer expired', { id, seconds, uuid, sseConnected: !!sseResponse, subscribedForUuid: subscribedUuids.has(uuid) });
 
-                if (sseResponse && subscribed) {
-                    const eventData = JSON.stringify({
-                        jsonrpc: "2.0",
-                        method: "notifications/message",
-                        params: {
-                            mcpType: "event",
-                            event: {
-                                key: id,
-                                name: "timer.finished",
-                                message: `⏰ RING! Timer ${id} (${seconds}s) expired!`
-                            }
+                const eventDataObj = {
+                    jsonrpc: "2.0",
+                    method: "notifications/message",
+                    params: {
+                        uuid,
+                        mcpType: "event",
+                        event: {
+                            key: id,
+                            name: "timer.finished",
+                            message: `⏰ RING! Timer ${id} (${seconds}s) expired!`
                         }
-                    });
+                    }
+                };
+                const eventData = JSON.stringify(eventDataObj);
 
-                    sseResponse.write(`data: ${eventData}\n\n`);
+                if (sseResponse && subscribedUuids.has(uuid)) {
+                    log('[NODE] Sending SSE event for UUID:', uuid, 'eventKey:', id);
+                    try {
+                        sseResponse.write(`data: ${eventData}\n\n`);
+                    } catch (e) {
+                        log('[NODE] Failed to send SSE event for UUID', uuid, e);
+                        // fallback to queue the event
+                        enqueueNotification(uuid, eventData);
+                    }
+                } else {
+                    // either SSE not connected or this uuid didn't subscribe => queue only if uuid subscribed
+                    if (subscribedUuids.has(uuid)) {
+                        log('[NODE] SSE not connected - queuing event for UUID:', uuid);
+                        enqueueNotification(uuid, eventData);
+                    } else {
+                        log('[NODE] UUID not subscribed - NOT sending nor queuing event for UUID:', uuid);
+                    }
                 }
 
                 timers.delete(id);
@@ -77,28 +152,47 @@ server.tool(
             // Persist timer info
             timers.set(id, { name: name || id, timeoutId, seconds });
 
-            // Notify variable via SSE if subscribed
-            if (sseResponse && subscribed) {
-                const varPayload = JSON.stringify({
-                    jsonrpc: "2.0",
-                    method: "notifications/message",
-                    params: {
-                        mcpType: "variable",
-                        name: id,
-                        value: { name: name || id, seconds }
-                    }
-                });
+            // Prepare the variable payload that describes the timer
+            const varPayloadObj = {
+                jsonrpc: "2.0",
+                method: "notifications/message",
+                params: {
+                    uuid,
+                    mcpType: "variable",
+                    name: id,
+                    value: { name: name || id, seconds }
+                }
+            };
+            const varPayload = JSON.stringify(varPayloadObj);
 
-                sseResponse.write(`data: ${varPayload}\n\n`);
+            // Notify variable via SSE if subscribed for this uuid; otherwise queue if subscribed but no SSE
+            if (sseResponse && subscribedUuids.has(uuid)) {
+                log('[TOOL][SET] Sending SSE variable for UUID:', uuid, 'key:', id);
+                try {
+                    sseResponse.write(`data: ${varPayload}\n\n`);
+                } catch (e) {
+                    log('[TOOL][SET] Failed to write SSE variable for UUID', uuid, e);
+                    enqueueNotification(uuid, varPayload);
+                }
+            } else {
+                if (subscribedUuids.has(uuid)) {
+                    log('[TOOL][SET] SSE not connected - queuing variable for UUID:', uuid);
+                    enqueueNotification(uuid, varPayload);
+                } else {
+                    log('[TOOL][SET] UUID did NOT subscribe - variable not sent/queued for UUID:', uuid);
+                }
             }
 
-            // Tool response (pure text)
-            return {
+            // Tool response (pure text) — include JSON payload in one text element so callers that parse it can use it
+            const response = {
+                uuid,
                 content: [
                     { type: 'text', text: `⏳ Timer ${id} started for ${seconds} seconds.` },
                     {
                         type: 'text',
+                        // also include the uuid inside the JSON payload so callers that parse it can see it
                         text: JSON.stringify({
+                            uuid,
                             mcpType: "variable",
                             name: id,
                             value: { name: name || id, seconds }
@@ -106,10 +200,14 @@ server.tool(
                     }
                 ]
             };
+
+            log('[TOOL][RESPONSE] Returning tool response for UUID:', uuid, 'response content:', response.content.map(c => (c.text ? c.text : c)));
+            return response;
         }
 
         // fallback
-        return { content: [{ type: 'text', text: "Unknown action" }] };
+        log('[TOOL] Unknown action', action);
+        return { uuid, content: [{ type: 'text', text: "Unknown action" }] };
     }
 );
 
@@ -130,7 +228,7 @@ app.post('/mcp', async (req, res) => {
 // SSE ENDPOINT
 // -------------------------
 app.get('/sse', (req, res) => {
-    console.log("[NODE] Nuovo client SSE connesso");
+    log("[NODE] New SSE client connected");
 
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
@@ -138,26 +236,30 @@ app.get('/sse', (req, res) => {
     res.flushHeaders();
 
     sseResponse = res;
+    log('[SSE] SSE stream established. subscribedUuidsCount=', subscribedUuids.size);
     res.write(": connected\n\n");
 
+    // When a client connects, flush queued notifications for subscribed UUIDs
+    flushPendingNotifications();
+
     req.on('close', () => {
-        console.log("[NODE] Client SSE disconnesso");
+        log("[NODE] SSE client disconnected");
         sseResponse = null;
-        subscribed = false;
+        // do not clear subscribedUuids: subscriptions are per-UUID and persist until explicitly removed
     });
 });
 
 const PORT = 3001;
 
 const httpServer = app.listen(PORT, () => {
-    console.log(`\n🚀 Timer Server running on port ${PORT}`);
-    console.log(`👉 POST http://localhost:${PORT}/mcp`);
-    console.log(`👉 GET  http://localhost:${PORT}/sse\n`);
+    log(`🚀 Timer Server running on port ${PORT}`);
+    log(`👉 POST http://localhost:${PORT}/mcp`);
+    log(`👉 GET  http://localhost:${PORT}/sse`);
 });
 
 httpServer.on('error', (error) => {
-    console.error("❌ HTTP ERROR:", error);
+    log("❌ HTTP ERROR:", error);
 });
 
-process.on('uncaughtException', err => console.error('❌ Uncaught Exception:', err));
-process.on('unhandledRejection', r => console.error('❌ Unhandled Rejection:', r));
+process.on('uncaughtException', err => log('❌ Uncaught Exception:', err));
+process.on('unhandledRejection', r => log('❌ Unhandled Rejection:', r));
