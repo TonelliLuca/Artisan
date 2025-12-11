@@ -17,46 +17,53 @@ public interface ReactBrain {
         Think step-by-step and output a structured reasoning result.
    
         Rules:
-            - NEVER call tools in this phase.
+            - IMPORTANT NEVER call tools in this phase and never do function call.
+            - ALWAYS return a brief reasoning summary.
+            - DO NOT return anything other than the reasoning summary.
+            - IMPORTANT - this summary will be used in the next phases.
     """)
     String reason(@V("goal")String goal, @V("lastStep")String lastStep, @V("context")String context);
 
     @UserMessage("""
-        You are the ACTION phase of a reactive agent.
+        You are the ACTION phase.
         Goal: {{goal}}
         Last step: {{lastStep}}
         Context: {{context}}
 
-        Decide and describe the exact action to take (tool call or passing).
+        Perform the necessary action using your available tools. If no tool is useful, you may decide not to act and must not call any tool.        
+        AFTER acting (or deciding not to act), return a JSON summary:
+        {
+          "tool_name": "The name of the tool you used (or null)",
+          "summary": "Brief result of the action"
+        }
+        
+        IMPORTANT:
+        - If you called a tool, 'tool_name' MUST be populated.
+        - This signals the system to wait for asynchronous events (SSE).
     """)
     String act(@V("goal")String goal, @V("lastStep")String lastStep, @V("context")String context);
 
     @UserMessage("""
-    You are the OBSERVATION phase of a reactive agent.
-
+    You are the OBSERVATION phase.
+    
     Goal: {{goal}}
+    Context Events: {{events}}  <-- SPOSTALO IN ALTO!
     Last step: {{lastStep}}
     Context: {{context}}
 
-    IMPORTANT:
-    You must return ONLY a valid JSON object as plain text.
-    No explanation. No prose. No commentary.
+    YOUR PRIORITY TASK:
+    Analyze the 'Context Events' list provided above.
+    
+    1. SEARCH specifically for completion events (like 'timer.finished', 'alert', etc.).
+    2. IF you see 'timer.finished' (or similar) inside Context Events -> THE GOAL IS COMPLETED.
+    3. IGNORE the internal state of variables if the Event says it is finished. Events are the source of truth.
 
-    The JSON MUST have exactly these fields:
+    Return ONLY JSON:
     {
       "completed": true|false,
-      "summary": "short string",
-      "beliefs": { ... }   // or an empty object {}
+      "summary": "FOUND event X, so completed / NO event found, waiting",
+      "beliefs": { ... }
     }
-
-    Rules:
-    - completed=true if the goal is achieved OR clearly impossible.
-    - completed=false if the agent should keep reasoning.
-    - beliefs is optional but must ALWAYS be an object ({} if empty).
-    - NEVER call tools in this phase.
-    - NEVER return anything that isn't valid JSON.
-    - NEVER return XML, markdown, or code blocks.
-    - ONLY the JSON object, nothing else.
 """)
-    String observe(@V("goal") String goal, @V("lastStep") String lastStep, @V("context") String context);
+    String observe(@V("goal") String goal, @V("lastStep") String lastStep, @V("context") String context, @V("events") String events);
 }
