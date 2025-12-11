@@ -16,6 +16,7 @@ public class Activity {
     public enum Status {
         REASONING,
         ACTION,
+        WAITING_FOR_EVENT,
         OBSERVATION,
         COMPLETED
     }

@@ -42,6 +42,7 @@ public class AsyncAgent<T extends ReactBrain> {
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final Map<String, Map<String, JsonNode>> variablesPerActivity = new ConcurrentHashMap<>();
     private final Map<String, List<JsonNode>> eventsPerActivity = new ConcurrentHashMap<>();
+    private final Map<String, Activity> pendingActivities = new ConcurrentHashMap<>();
 
     private final String sseUrl;
 
@@ -125,29 +126,91 @@ public class AsyncAgent<T extends ReactBrain> {
                         activity.addStep(new ReasoningStep("reason", activity.getGoal(), reasoningResult, snapshot));
                         activity.setStatus(Activity.Status.ACTION);
                         logger.info("Activity {} moved to ACTION", activity.getUuid());
+                        activityQueue.offer(activity);
                     }
                     case ACTION -> {
-                        // Tools / external calls should only happen in ACTION.
-                        String actionResult = invokeAgentMethod("act", activity.getGoal(), lastStepJson, contextJson);
+                        List<JsonNode> currentEvents = eventsPerActivity.get(activityUuid);
+                        int initialEventCount = (currentEvents == null) ? 0 : currentEvents.size();
+                        String actionResultJson = invokeAgentMethod("act", activity.getGoal(), lastStepJson, contextJson);
+                        logger.info("🛠️ Action Result: {}", actionResultJson);
+                        String toolName = null;
+                        try {
+                            JsonNode node = objectMapper.readTree(actionResultJson);
+                            if (node.has("tool_name") && !node.get("tool_name").isNull()) {
+                                toolName = node.get("tool_name").asText();
+                            }
+                        } catch (Exception e) {
+                            logger.warn("⚠️ Invalid JSON in ACT response: {}", actionResultJson);
+                        }
+
                         Map<String, Object> snapshot = snapshotVariables(activityUuid);
-                        activity.addStep(new ReasoningStep("act", activity.getGoal(), actionResult, snapshot));
-                        activity.setStatus(Activity.Status.OBSERVATION);
-                        logger.info("Activity {} moved to OBSERVATION", activity.getUuid());
+                        activity.addStep(new ReasoningStep("act", activity.getGoal(), actionResultJson, snapshot));
+
+                        if (toolName != null && !toolName.isEmpty() && !toolName.equalsIgnoreCase("null")) {
+
+                            logger.info("🛠️ Tool Call Detected: '{}'. Checking for immediate events...", toolName);
+
+                            // Check if events arrived WHILE the LLM was thinking/acting
+                            List<JsonNode> updatedEvents = eventsPerActivity.get(activityUuid);
+                            int newEventCount = (updatedEvents == null) ? 0 : updatedEvents.size();
+
+                            if (newEventCount > initialEventCount) {
+
+                                // Race condition handled: event arrived while we were busy.
+                                logger.info("⚡ Event arrived DURING action execution! Skipping suspension for Activity {}.", activityUuid);
+
+                                // Do not suspend — go directly to OBSERVATION to process the already-arrived event
+                                activity.setStatus(Activity.Status.OBSERVATION);
+                                activityQueue.offer(activity);
+
+                            } else {
+                                // Normal case: no new event, suspend and wait
+                                logger.info("💤 Suspending Activity {} (Waiting for future event)", activityUuid);
+                                activity.setStatus(Activity.Status.WAITING_FOR_EVENT);
+                                pendingActivities.put(activityUuid, activity);
+                            }
+
+                        } else {
+
+                            logger.info("⏩ No Tool Call. Proceeding to OBSERVE immediately.");
+
+                            activity.setStatus(Activity.Status.OBSERVATION);
+                            activityQueue.offer(activity);
+                        }
                     }
                     case OBSERVATION -> {
-                        String obsResult = invokeAgentMethod("observe", activity.getGoal(), lastStepJson, contextJson);
+                        // 1. Serialize the Java list to JSON string for the LLM
+                        List<JsonNode> eventsList = eventsPerActivity.getOrDefault(activityUuid, Collections.emptyList());
+                        String eventsJson = "[]";
+                        try {
+                            eventsJson = objectMapper.writeValueAsString(eventsList);
+                        } catch (Exception e) {
+                            logger.warn("Failed to serialize events", e);
+                        }
+                        logger.debug("Serialized events for activity {}: {}", activityUuid, eventsJson);
+
+                        // 2. Invoke: pass 'eventsJson' (String) instead of the list
+                        String obsResult = invokeAgentMethod("observe", activity.getGoal(), lastStepJson, contextJson, eventsJson);
+
                         Map<String, Object> snapshot = snapshotVariables(activityUuid);
                         activity.addStep(new ReasoningStep("observe", activity.getGoal(), obsResult, snapshot));
 
+                        // 3. Consume: clear read events to avoid reprocessing on next loop
+                        if (eventsPerActivity.containsKey(activityUuid)) {
+                            eventsPerActivity.get(activityUuid).clear();
+                            logger.debug("🧹 Cleared consumed events for activity {}", activityUuid);
+                        }
+
+                        // Standard completion logic
                         boolean completed = parseCompleted(obsResult);
                         if (completed) {
                             activity.setStatus(Activity.Status.COMPLETED);
                             logger.info("Activity {} marked COMPLETED by observe", activity.getUuid());
                         } else {
-                            // cycle back to reasoning by default
                             activity.setStatus(Activity.Status.REASONING);
                             logger.info("Activity {} cycled back to REASONING", activity.getUuid());
                         }
+                        activityQueue.offer(activity);
                     }
                     case COMPLETED -> {
                         logger.debug("Activity {} already completed", activity.getUuid());
@@ -156,8 +219,6 @@ public class AsyncAgent<T extends ReactBrain> {
                         logger.warn("Unknown activity status for {}: {}", activity.getUuid(), status);
                     }
                 }
-                // requeue for next phase
-                activityQueue.offer(activity);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 logger.info("Event loop interrupted");
@@ -284,12 +345,9 @@ public class AsyncAgent<T extends ReactBrain> {
             if (params.has("mcpType")) {
                 mcpType = params.get("mcpType").asText();
             }
+            String msgUuid = params.has("uuid") ? params.get("uuid").asText() : "global";
 
             if ("variable".equalsIgnoreCase(mcpType)) {
-
-                // determine message uuid (which should have been provided by the tool)
-                String msgUuid = params.has("uuid") ? params.get("uuid").asText() : "global";
-
                 // support both "name" and "key" as the variable identifier
                 String name = null;
                 if (params.has("name")) name = params.get("name").asText();
@@ -306,7 +364,6 @@ public class AsyncAgent<T extends ReactBrain> {
             }
 
             if ("event".equalsIgnoreCase(mcpType)) {
-                String msgUuid = params.has("uuid") ? params.get("uuid").asText() : "global";
                 JsonNode eventPayload = null;
                 if (params.has("payload")) eventPayload = params.get("payload");
                 else if (params.has("event")) eventPayload = params.get("event");
@@ -316,10 +373,24 @@ public class AsyncAgent<T extends ReactBrain> {
                     eventPayload = eventPayload.get("event");
                 }
 
-                eventsPerActivity.computeIfAbsent(msgUuid, k -> new CopyOnWriteArrayList<>()).add(eventPayload);
+                if (msgUuid != null) {
+                    // 1. Store the event (memory)
+                    eventsPerActivity.computeIfAbsent(msgUuid, k -> new CopyOnWriteArrayList<>()).add(eventPayload);
+                    logger.info("📥 Event stored for uuid {}: {}", msgUuid, eventPayload);
 
-                logger.info("📥 Event stored for uuid {}: {}", msgUuid, eventPayload);
-
+                    // 2. Resume: wake up any activity waiting for this UUID
+                    Activity pending = pendingActivities.remove(msgUuid); // remove from pending map
+                    if (pending != null) {
+                        pending.setStatus(Activity.Status.OBSERVATION); // set next state
+                        activityQueue.offer(pending); // put back into the main loop
+                        logger.info("🔔 WAKING UP Activity {} -> Resumed to OBSERVATION", msgUuid);
+                    } else {
+                        // If the activity is not pending (maybe finished or running), just log
+                        logger.debug("Event received for {} but activity is not in PENDING state.", msgUuid);
+                    }
+                } else {
+                    logger.warn("Received event without UUID, cannot route to activity: {}", eventPayload);
+                }
                 return;
             }
 
@@ -379,3 +450,4 @@ public class AsyncAgent<T extends ReactBrain> {
         }
     }
 }
+
