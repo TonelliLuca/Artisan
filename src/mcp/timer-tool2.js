@@ -77,22 +77,22 @@ server.tool(
 
             // If SSE is connected, acknowledge via SSE too (and flush any queued notifications)
             const msg = { uuid, content: [{ type: 'text', text: "✅ Subscription activated. You will receive events and variables via SSE." }] };
-            if (sseResponse) {
-                const payload = JSON.stringify({
-                    jsonrpc: "2.0",
-                    method: "notifications/message",
-                    params: { uuid, mcpType: "event", event: { key: "subscription", name: "subscription.activated", message: "Subscription active" } }
-                });
-                try {
-                    sseResponse.write(`data: ${payload}\n\n`);
-                } catch (e) {
-                    log('[TOOL][SUBSCRIBE] Failed to write SSE ack for UUID', uuid, e);
-                }
-                // flush any pending notifications for this uuid
-                flushPendingNotifications();
-            } else {
-                log('[TOOL][SUBSCRIBE] SSE not connected; subscription recorded for UUID', uuid);
-            }
+            // if (sseResponse) {
+            //     const payload = JSON.stringify({
+            //         jsonrpc: "2.0",
+            //         method: "notifications/message",
+            //         params: { uuid, mcpType: "event", event: { key: "subscription", name: "subscription.activated", message: "Subscription active" } }
+            //     });
+            //     try {
+            //         sseResponse.write(`data: ${payload}\n\n`);
+            //     } catch (e) {
+            //         log('[TOOL][SUBSCRIBE] Failed to write SSE ack for UUID', uuid, e);
+            //     }
+            //     // flush any pending notifications for this uuid
+            //     flushPendingNotifications();
+            // } else {
+            //     log('[TOOL][SUBSCRIBE] SSE not connected; subscription recorded for UUID', uuid);
+            // }
 
             return msg;
         }
