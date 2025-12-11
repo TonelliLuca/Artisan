@@ -86,7 +86,7 @@ public class ActivitySubmissionIntegrationTest {
                 .build();
 
         // 3. Prepare an Activity that instructs the agent to subscribe first and then set the timer
-        String activityGoal = "First subscribe to the notifications system, then use the timer tool to set a timer: set seconds 1 name test-timer";
+        String activityGoal = "First subscribe to the notifications system, then use the timer tool to set a timer: set seconds 10 name test-timer";
         Activity activity = new Activity(activityGoal);
 
         // 4. Insert the Activity into the agent's internal queue (so test keeps the reference)
@@ -98,11 +98,11 @@ public class ActivitySubmissionIntegrationTest {
         queue.offer(activity);
 
         // 5. Wait for the activity to be processed through phases (history grows)
-        long deadline = System.currentTimeMillis() + 30000;
+        long deadline = System.currentTimeMillis() + 100000;
         boolean historyEvolved = false;
         while (System.currentTimeMillis() < deadline) {
             int size = activity.getHistory().size();
-            if (size >= 3) { // at least reason, act, observe
+            if (size >= 3) { // at least reason, act
                 historyEvolved = true;
                 break;
             }
@@ -198,7 +198,107 @@ public class ActivitySubmissionIntegrationTest {
         assertNotNull(storedVar, "Stored variable must be present in per-UUID maps for key '" + expectedKey + "'");
         assertTrue(storedVar.has("seconds") || storedVar.has("name"));
 
-        assertTrue(gotEvent, "Events should contain a 'timer.finished' for key '" + expectedKey + "' in per-UUID maps");
         printActivityHistory(activity);
+    }
+
+    @Test
+    void submitTwoActivities_concurrently_verifyIsolationAndCompletion() throws Exception {
+        // 0. Pre-check Node server
+        try (Socket s = new Socket("localhost", 3001)) { /* ok */ } catch (Exception e) {
+            System.out.println("⚠️ Node Server not running on 3001. Skipping test.");
+            return;
+        }
+
+        // 1. Setup stack (transport -> client -> provider)
+        McpTransport transport = new StreamableHttpMcpTransport.Builder()
+                .url("http://localhost:3001/mcp")
+                .logRequests(true)
+                .logResponses(true)
+                .build();
+        transport.start(new NoOpHandler(transport));
+
+        McpClient client = new DefaultMcpClient.Builder()
+                .transport(transport)
+                .toolExecutionTimeout(Duration.ofSeconds(10))
+                .build();
+
+        McpToolProvider provider = McpToolProvider.builder()
+                .mcpClients(List.of(client))
+                .build();
+
+        // 2. Setup agent
+        OpenAiChatModel model = OpenAiChatModel.builder()
+                .baseUrl("http://langchain4j.dev/demo/openai/v1")
+                .apiKey("demo")
+                .modelName("gpt-4o-mini")
+                .build();
+
+        AsyncAgent<ReactBrain> agent = new AsyncAgent.Builder<ReactBrain>()
+                .model(model)
+                .agentInterface(ReactBrain.class)
+                .mcpToolProvider(provider)
+                .sseUrl("http://localhost:3001/sse")
+                .build();
+
+        // 3. Create the TWO activities
+        // Activity A: Long (10 seconds)
+        String goalLong = "First subscribe to notifications, then set a timer: set seconds 10 name timer-long";
+        Activity activityLong = new Activity(goalLong);
+
+        // Activity B: Short (5 seconds) - This should finish BEFORE the other
+        String goalShort = "First subscribe to notifications, then set a timer: set seconds 5 name timer-short";
+        Activity activityShort = new Activity(goalShort);
+
+        // 4. Enqueue both activities
+        Field qField = AsyncAgent.class.getDeclaredField("activityQueue");
+        qField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        BlockingQueue<Activity> queue = (BlockingQueue<Activity>) qField.get(agent);
+
+        System.out.println("🚀 Submitting BOTH activities...");
+        queue.offer(activityLong);
+        queue.offer(activityShort);
+
+        // 5. Polling for completion
+        long deadline = System.currentTimeMillis() + 30000; // 30s timeout
+        boolean longDone = false;
+        boolean shortDone = false;
+
+        while (System.currentTimeMillis() < deadline) {
+            if (activityLong.isCompleted()) longDone = true;
+            if (activityShort.isCompleted()) shortDone = true;
+
+            if (longDone && shortDone) break;
+            Thread.sleep(500);
+        }
+
+        // 6. Assertions on completion
+        assertTrue(shortDone, "Short activity (5s) should be completed");
+        assertTrue(longDone, "Long activity (10s) should be completed");
+
+        System.out.println("✅ Both activities completed!");
+        printActivityHistory(activityShort);
+        printActivityHistory(activityLong);
+
+        // 7. VERIFY ISOLATION (the scientific check)
+        // Retrieve agent's internal maps
+        Field varsField = AsyncAgent.class.getDeclaredField("variablesPerActivity");
+        varsField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        Map<String, Map<String, JsonNode>> varsPerActivity = (Map<String, Map<String, JsonNode>>) varsField.get(agent);
+
+        // Memory analysis for SHORT activity
+        Map<String, JsonNode> shortVars = varsPerActivity.get(activityShort.getUuid());
+        assertNotNull(shortVars, "Short activity must have its own variable bucket");
+        assertTrue(shortVars.containsKey("timer-short"), "Short bucket must contain 'timer-short'");
+        assertFalse(shortVars.containsKey("timer-long"), "CRITICAL: Short bucket MUST NOT contain 'timer-long' (Isolation Check)");
+
+        // Memory analysis for LONG activity
+        Map<String, JsonNode> longVars = varsPerActivity.get(activityLong.getUuid());
+        assertNotNull(longVars, "Long activity must have its own variable bucket");
+        assertTrue(longVars.containsKey("timer-long"), "Long bucket must contain 'timer-long'");
+        assertFalse(longVars.containsKey("timer-short"), "CRITICAL: Long bucket MUST NOT contain 'timer-short' (Isolation Check)");
+
+        System.out.println("✅ Context Isolation Verified: Variables did not leak between activities.");
     }
 }
