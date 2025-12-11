@@ -314,7 +314,7 @@ public class AgentTest {
 
             System.out.println("🤖 Asking agent to subscribe to notifications...");
             try {
-                var reply = agent.brain().chat("Call the timerTool with action parameter = subscribe", uuid);
+                var reply = agent.brain().chat("I want you to call the timerTool with action parameter = subscribe", uuid);
                 System.out.println("🤖 Agent subscribe reply: " + reply);
             } catch (java.lang.reflect.UndeclaredThrowableException ute) {
                 System.out.println("⚠️ agent.brain().chat (subscribe) raised UndeclaredThrowableException (continuing)");
