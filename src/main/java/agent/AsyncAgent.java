@@ -49,6 +49,8 @@ public class AsyncAgent<T extends ReactBrain> {
     private final BlockingQueue<Activity> activityQueue = new LinkedBlockingQueue<>();
     private final AtomicBoolean loopRunning = new AtomicBoolean(true);
 
+    private static final int WINDOW_SIZE = 5;
+
     private AsyncAgent(Builder<T> builder) {
         this.model = builder.model;
         this.agentInterface = builder.agentInterface;
@@ -103,7 +105,7 @@ public class AsyncAgent<T extends ReactBrain> {
                 logger.debug("Processing activity {} phase={}", activity.getUuid(), phase);
 
                 // prepare lastStep and context payloads expected by ReactBrain methods
-                String lastStepJson = activity.lastStep().map(ReasoningStep::toJson).orElse("");
+                String history = this.extractActivityHistory(activity, WINDOW_SIZE);
                 // compute activityUuid early so snapshots can be tied to the correct activity
                 String activityUuid = activity.getUuid().toString();
                 String contextJson;
@@ -121,7 +123,7 @@ public class AsyncAgent<T extends ReactBrain> {
 
                 switch (status) {
                     case REASONING -> {
-                        String reasoningResult = invokeAgentMethod("reason", activity.getGoal(), lastStepJson, contextJson);
+                        String reasoningResult = invokeAgentMethod("reason", activity.getGoal(), history, contextJson);
                         Map<String, Object> snapshot = snapshotVariables(activityUuid);
                         activity.addStep(new ReasoningStep("reason", activity.getGoal(), reasoningResult, snapshot));
                         activity.setStatus(Activity.Status.ACTION);
@@ -131,7 +133,7 @@ public class AsyncAgent<T extends ReactBrain> {
                     case ACTION -> {
                         List<JsonNode> currentEvents = eventsPerActivity.get(activityUuid);
                         int initialEventCount = (currentEvents == null) ? 0 : currentEvents.size();
-                        String actionResultJson = invokeAgentMethod("act", activity.getGoal(), lastStepJson, contextJson);
+                        String actionResultJson = invokeAgentMethod("act", activity.getGoal(), history, contextJson);
                         logger.info("🛠️ Action Result: {}", actionResultJson);
                         String toolName = null;
                         try {
@@ -190,7 +192,7 @@ public class AsyncAgent<T extends ReactBrain> {
                         logger.debug("Serialized events for activity {}: {}", activityUuid, eventsJson);
 
                         // 2. Invoke: pass 'eventsJson' (String) instead of the list
-                        String obsResult = invokeAgentMethod("observe", activity.getGoal(), lastStepJson, contextJson, eventsJson);
+                        String obsResult = invokeAgentMethod("observe", activity.getGoal(), history, contextJson, eventsJson);
 
                         Map<String, Object> snapshot = snapshotVariables(activityUuid);
                         activity.addStep(new ReasoningStep("observe", activity.getGoal(), obsResult, snapshot));
@@ -399,6 +401,17 @@ public class AsyncAgent<T extends ReactBrain> {
         } catch (Exception e) {
             logger.error("Failed to handle MCP event", e);
         }
+    }
+
+    private String extractActivityHistory(Activity activity, int windowSize) {
+        StringBuilder historyBuilder = new StringBuilder();
+        List<ReasoningStep> steps = activity.getHistory();
+        int start = Math.max(0, steps.size() - windowSize);
+        for (int i = start; i < steps.size(); i++) {
+            ReasoningStep step = steps.get(i);
+            historyBuilder.append(step.toJson()).append("\n");
+        }
+        return historyBuilder.toString();
     }
 
     public T brain() {

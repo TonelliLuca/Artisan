@@ -11,7 +11,8 @@ public interface ReactBrain {
     @UserMessage("""
         You are the REASONING phase of a reactive agent.
         Goal: {{goal}}
-        Last step: {{lastStep}}
+        RECENT HISTORY:
+        {{history}}
         Context: {{context}}
 
         Think step-by-step and output a structured reasoning result.
@@ -22,12 +23,13 @@ public interface ReactBrain {
             - DO NOT return anything other than the reasoning summary.
             - IMPORTANT - this summary will be used in the next phases.
     """)
-    String reason(@V("goal")String goal, @V("lastStep")String lastStep, @V("context")String context);
+    String reason(@V("goal")String goal, @V("history")String history, @V("context")String context);
 
     @UserMessage("""
         You are the ACTION phase.
         Goal: {{goal}}
-        Last step: {{lastStep}}
+        RECENT HISTORY:
+        {{history}}
         Context: {{context}}
 
         Perform the necessary action using your available tools. If no tool is useful, you may decide not to act and must not call any tool.        
@@ -41,14 +43,15 @@ public interface ReactBrain {
         - If you called a tool, 'tool_name' MUST be populated.
         - This signals the system to wait for asynchronous events (SSE).
     """)
-    String act(@V("goal")String goal, @V("lastStep")String lastStep, @V("context")String context);
+    String act(@V("goal")String goal, @V("history")String history, @V("context")String context);
 
     @UserMessage("""
     You are the OBSERVATION phase.
     
     Goal: {{goal}}
-    Context Events: {{events}}  <-- SPOSTALO IN ALTO!
-    Last step: {{lastStep}}
+    Context Events: {{events}}
+    RECENT HISTORY:
+    {{history}}
     Context: {{context}}
 
     YOUR PRIORITY TASK:
@@ -65,5 +68,5 @@ public interface ReactBrain {
       "beliefs": { ... }
     }
 """)
-    String observe(@V("goal") String goal, @V("lastStep") String lastStep, @V("context") String context, @V("events") String events);
+    String observe(@V("goal") String goal, @V("history") String history, @V("context") String context, @V("events") String events);
 }
