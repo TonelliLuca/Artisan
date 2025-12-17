@@ -71,28 +71,42 @@ server.tool(
         // SUBSCRIBE
         // -------------------------
         if (action === "subscribe") {
-            // Always record the subscription intent for this uuid.
             subscribedUuids.add(uuid);
             log('[TOOL][SUBSCRIBE] UUID subscribed:', uuid, 'sseConnected=', !!sseResponse);
 
-            // If SSE is connected, acknowledge via SSE too (and flush any queued notifications)
-            const msg = { uuid, content: [{ type: 'text', text: "✅ Subscription activated. You will receive events and variables via SSE." }] };
-            // if (sseResponse) {
-            //     const payload = JSON.stringify({
-            //         jsonrpc: "2.0",
-            //         method: "notifications/message",
-            //         params: { uuid, mcpType: "event", event: { key: "subscription", name: "subscription.activated", message: "Subscription active" } }
-            //     });
-            //     try {
-            //         sseResponse.write(`data: ${payload}\n\n`);
-            //     } catch (e) {
-            //         log('[TOOL][SUBSCRIBE] Failed to write SSE ack for UUID', uuid, e);
-            //     }
-            //     // flush any pending notifications for this uuid
-            //     flushPendingNotifications();
-            // } else {
-            //     log('[TOOL][SUBSCRIBE] SSE not connected; subscription recorded for UUID', uuid);
-            // }
+            const eventPayloadObj = {
+                jsonrpc: "2.0",
+                method: "notifications/message",
+                params: {
+                    uuid,
+                    mcpType: "event",
+                    event: {
+                        key: "subscription-ack",
+                        name: "subscription.started",
+                        message: "Subscription successfully activated via SSE"
+                    }
+                }
+            };
+            const eventPayload = JSON.stringify(eventPayloadObj);
+
+            if (sseResponse) {
+                log('[TOOL][SUBSCRIBE] Sending SSE ack immediately for UUID:', uuid);
+                try {
+                    sseResponse.write(`data: ${eventPayload}\n\n`);
+                } catch (e) {
+                    log('[TOOL][SUBSCRIBE] Failed to write SSE ack, queuing instead', uuid, e);
+                    enqueueNotification(uuid, eventPayload);
+                }
+            } else {
+                log('[TOOL][SUBSCRIBE] SSE not connected yet; queuing ack for UUID:', uuid);
+                enqueueNotification(uuid, eventPayload);
+            }
+
+            // 4. Risposta standard del Tool (Testo)
+            const msg = {
+                uuid,
+                content: [{ type: 'text', text: "✅ Subscription activated. You will receive events and variables via SSE." }]
+            };
 
             return msg;
         }
