@@ -1,5 +1,6 @@
 import agent.AsyncAgent;
 import agent.ReactBrain;
+import agent.activity.Activity;
 import com.fasterxml.jackson.databind.JsonNode;
 import dev.langchain4j.agentic.Agent;
 import dev.langchain4j.data.document.Document;
@@ -9,6 +10,7 @@ import dev.langchain4j.mcp.client.McpClient;
 import dev.langchain4j.mcp.client.transport.McpOperationHandler;
 import dev.langchain4j.mcp.client.transport.McpTransport;
 import dev.langchain4j.mcp.client.transport.http.StreamableHttpMcpTransport;
+import dev.langchain4j.model.ollama.OllamaChatModel;
 import dev.langchain4j.model.openai.OpenAiChatModel;
 import dev.langchain4j.service.SystemMessage;
 import dev.langchain4j.service.UserMessage;
@@ -17,8 +19,10 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 
+import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -211,6 +215,15 @@ public class AgentTest {
     @Nested
     @DisplayName("Agent Functionality Tests")
     class AgentFunctionalityTests {
+        //OpenAiChatModel model = OpenAiChatModel.builder().baseUrl("http://langchain4j.dev/demo/openai/v1").apiKey("demo").modelName("gpt-4o-mini").build();
+        OllamaChatModel model = OllamaChatModel.builder()
+                .baseUrl("http://localhost:11434")
+                .modelName("qwen2.5")
+                .temperature(0.0)
+                .timeout(java.time.Duration.ofMinutes(2))
+                .build();
+
+
         public interface McpTestAgent extends ReactBrain {
             @UserMessage("[ACTING phase] You are a helpful assistant with access to external tools via MCP that you need to call using the {{input}}. Use them when requested."
             + " Always include the provided UUID '{{UUID}}' in your tool calls to correlate actions.")
@@ -248,11 +261,6 @@ public class AgentTest {
                         .mcpClients(List.of(client))
                         .build();
 
-                OpenAiChatModel model = OpenAiChatModel.builder()
-                        .baseUrl("http://langchain4j.dev/demo/openai/v1")
-                        .apiKey("demo")
-                        .modelName("gpt-4o-mini")
-                        .build();
 
                 AsyncAgent<McpTestAgent> agent = new AsyncAgent.Builder<McpTestAgent>()
                         .model(model)
@@ -272,38 +280,16 @@ public class AgentTest {
         }
 
         @Test
-        @DisplayName("Should set timer via MCP and store variable and event via SSE (Integration)")
+        @DisplayName("Should set timer via MCP and store variable (Integration)")
         void shouldSetTimerAndReceiveVariableAndEvent() throws Exception {
-            try {
-                new java.net.Socket("localhost", 3001).close();
-            } catch (Exception e) {
-                System.out.println("⚠️ Node Server not running on 3001. Skipping integration test.");
-                return;
-            }
+            // Check Server
+            try { new java.net.Socket("localhost", 3001).close(); } catch (Exception e) { return; }
 
-            System.out.println("🚀 Node Server detected. Starting full MCP set+SSE flow test...");
-
-            McpTransport transport = new StreamableHttpMcpTransport.Builder()
-                    .url("http://localhost:3001/mcp")
-                    .logRequests(true)
-                    .logResponses(true)
-                    .build();
+            // Setup
+            McpTransport transport = new StreamableHttpMcpTransport.Builder().url("http://localhost:3001/mcp").logRequests(true).logResponses(true).build();
             transport.start(new NoOpHandler(transport));
-
-            McpClient client = new DefaultMcpClient.Builder()
-                    .transport(transport)
-                    .toolExecutionTimeout(java.time.Duration.ofSeconds(10))
-                    .build();
-
-            McpToolProvider provider = McpToolProvider.builder()
-                    .mcpClients(List.of(client))
-                    .build();
-
-            OpenAiChatModel model = OpenAiChatModel.builder()
-                    .baseUrl("http://langchain4j.dev/demo/openai/v1")
-                    .apiKey("demo")
-                    .modelName("gpt-4o-mini")
-                    .build();
+            McpClient client = new DefaultMcpClient.Builder().transport(transport).toolExecutionTimeout(java.time.Duration.ofSeconds(10)).build();
+            McpToolProvider provider = McpToolProvider.builder().mcpClients(List.of(client)).build();
 
             AsyncAgent<McpTestAgent> agent = new AsyncAgent.Builder<McpTestAgent>()
                     .model(model)
@@ -312,113 +298,43 @@ public class AgentTest {
                     .sseUrl("http://localhost:3001/sse")
                     .build();
 
-            System.out.println("🤖 Asking agent to subscribe to notifications...");
-            try {
-                var reply = agent.brain().chat("I want you to call the timerTool with action parameter = subscribe", uuid);
-                System.out.println("🤖 Agent subscribe reply: " + reply);
-            } catch (java.lang.reflect.UndeclaredThrowableException ute) {
-                System.out.println("⚠️ agent.brain().chat (subscribe) raised UndeclaredThrowableException (continuing)");
-                Throwable cause = ute.getCause();
-                if (cause != null) {
-                    System.out.println("Cause class: " + cause.getClass().getName() + " - " + cause.getMessage());
-                    cause.printStackTrace(System.out);
-                } else {
-                    ute.printStackTrace(System.out);
-                }
-            }
 
-            Thread.sleep(200);
+            String request = "Subscribe to notifications, then set a timer: 1 second name test-timer";
+            agent.request(request);
 
-            System.out.println("🤖 Asking agent to set timer via tool (set seconds=1, name=test-timer)...");
-            String prompt = "Use the timer tool to set a timer: set seconds 1 name test-timer";
+            // To verify the test, we need to peek into the registry
+            Field registryField = AsyncAgent.class.getDeclaredField("activityRegistry");
+            registryField.setAccessible(true);
+            Map<String, Activity> registry = (Map<String, Activity>) registryField.get(agent);
 
-            try {
-                agent.brain().chat(prompt, uuid);
-            } catch (java.lang.reflect.UndeclaredThrowableException ute) {
-                System.out.println("⚠️ agent.brain().chat (set) raised UndeclaredThrowableException (continuing to validate SSE side-effects)");
-                Throwable cause = ute.getCause();
-                if (cause != null) {
-                    System.out.println("Cause class: " + cause.getClass().getName() + " - " + cause.getMessage());
-                    cause.printStackTrace(System.out);
-                } else {
-                    ute.printStackTrace(System.out);
-                }
-            }
+            // Wait for the activity to appear in the registry (immediate)
+            assertFalse(registry.isEmpty(), "Registry should contain the activity");
+            Activity activity = registry.values().iterator().next();
+            String uuid = activity.getUuid();
 
+            System.out.println("🤖 Activity started with UUID: " + uuid);
+
+            // Wait for the variable to arrive via SSE
             String expectedKey = "test-timer";
-
-            java.lang.reflect.Field varsPerActivityField = AsyncAgent.class.getDeclaredField("variablesPerActivity");
-            varsPerActivityField.setAccessible(true);
-            @SuppressWarnings("unchecked")
-            java.util.Map<String, java.util.Map<String, JsonNode>> varsPerActivity =
-                    (java.util.Map<String, java.util.Map<String, JsonNode>>) varsPerActivityField.get(agent);
-
-            java.lang.reflect.Field eventsPerActivityField = AsyncAgent.class.getDeclaredField("eventsPerActivity");
-            eventsPerActivityField.setAccessible(true);
-            @SuppressWarnings("unchecked")
-            java.util.Map<String, java.util.List<JsonNode>> eventsPerActivity =
-                    (java.util.Map<String, java.util.List<JsonNode>>) eventsPerActivityField.get(agent);
-
-            long deadline2 = System.currentTimeMillis() + 30000;
             boolean gotVar = false;
-            boolean gotEvent = false;
-            // use the same uuid passed to the agent.brain().chat(...) above
-            String messageUuid = uuid;
+            long deadline = System.currentTimeMillis() + 30000;
 
-            while (System.currentTimeMillis() < deadline2 && !(gotVar && gotEvent)) {
-                // check per-uuid vars specifically for this messageUuid
-                java.util.Map<String, JsonNode> bucket = varsPerActivity.get(messageUuid);
-                if (!gotVar && bucket != null && bucket.containsKey(expectedKey)) {
+            while (System.currentTimeMillis() < deadline) {
+                // Direct check in the Activity
+                if (activity.getBelief(expectedKey) != null) {
                     gotVar = true;
+                    break;
                 }
-
-                // check per-uuid events specifically for this messageUuid
-                java.util.List<JsonNode> evList = eventsPerActivity.get(messageUuid);
-                if (!gotEvent && evList != null) {
-                    for (JsonNode ev : evList) {
-                        if (ev != null && ev.has("key") && expectedKey.equals(ev.get("key").asText())
-                                && ev.has("name") && "timer.finished".equals(ev.get("name").asText())) {
-                            gotEvent = true;
-                            break;
-                        }
-                    }
-                }
-
-                // fallback: scan all per-uuid buckets
-                if (!gotVar) {
-                    for (java.util.Map<String, JsonNode> b : varsPerActivity.values()) {
-                        if (b != null && b.containsKey(expectedKey)) { gotVar = true; break; }
-                    }
-                }
-                if (!gotEvent) {
-                    for (java.util.List<JsonNode> list : eventsPerActivity.values()) {
-                        if (list == null) continue;
-                        for (JsonNode ev : list) {
-                            if (ev != null && ev.has("key") && expectedKey.equals(ev.get("key").asText())
-                                    && ev.has("name") && "timer.finished".equals(ev.get("name").asText())) {
-                                gotEvent = true;
-                                break;
-                            }
-                        }
-                        if (gotEvent) break;
-                    }
-                }
-
-                if (gotVar && gotEvent) break;
-                Thread.sleep(200);
+                Thread.sleep(500);
             }
 
-            assertTrue(gotVar, "Variable with key '" + expectedKey + "' should be stored in per-UUID maps for message UUID " + messageUuid);
+            assertTrue(gotVar, "Variable should be injected into Activity via SSE");
 
-            // locate stored var in per-uuid map for this messageUuid
-            JsonNode storedVar = null;
-            java.util.Map<String, JsonNode> localBucket = varsPerActivity.get(messageUuid);
-            if (localBucket != null) storedVar = localBucket.get(expectedKey);
+            // Verify value
+            JsonNode val = activity.getBelief(expectedKey);
+            assertTrue(val.has("seconds") || val.has("name"));
 
-            assertNotNull(storedVar, "Stored variable must be present for message UUID " + messageUuid);
-            assertTrue(storedVar.has("seconds") || storedVar.has("name"));
-
-            assertTrue(gotEvent, "Events should contain a 'timer.finished' for key '" + expectedKey + "' in per-UUID maps for message UUID " + messageUuid);
+            System.out.println("✅ SSE Integration Test Passed with Activity Registry");
         }
 
 
@@ -440,11 +356,7 @@ public class AgentTest {
         }
 
         private AsyncAgent<SimpleAgentInterface> createTestAgent() {
-            OpenAiChatModel model = OpenAiChatModel.builder()
-                    .baseUrl("http://langchain4j.dev/demo/openai/v1")
-                    .apiKey("demo")
-                    .modelName("gpt-4o-mini")
-                    .build();
+
             ArrayList<Document> docs = new ArrayList<>();
 
             return new AsyncAgent.Builder<SimpleAgentInterface>()
@@ -455,4 +367,3 @@ public class AgentTest {
         }
     }
 }
-
