@@ -1,18 +1,19 @@
 
 package agent.activity;
 
-import java.util.List;
-import java.util.Optional;
-import java.util.UUID;
+import com.fasterxml.jackson.databind.JsonNode;
+
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.Collections;
 
 public class Activity {
     private final UUID uuid;
     private final String goal;
     private volatile Status status;
     private final List<ReasoningStep> history = new CopyOnWriteArrayList<>();
-
+    private final Map<String, JsonNode> beliefs = new ConcurrentHashMap<>();
+    private final List<JsonNode> incomingEvents = new CopyOnWriteArrayList<>();
     public enum Status {
         REASONING,
         ACTION,
@@ -24,9 +25,46 @@ public class Activity {
     public Activity(String goal) {
         this.uuid = UUID.randomUUID();
         this.goal = goal;
-        this.status = Status.REASONING;
+        this.status = Status.OBSERVATION;
     }
 
+    public void pushEvent(JsonNode event) {
+        incomingEvents.add(event);
+    }
+
+    public List<JsonNode> consumeEvents() {
+        List<JsonNode> current = new ArrayList<>(incomingEvents);
+        incomingEvents.clear();
+        return current;
+    }
+
+    public boolean hasEvents() {
+        return !incomingEvents.isEmpty();
+    }
+
+    public void setBelief(String key, JsonNode value) {
+        if (value != null) {
+            beliefs.put(key, value);
+        }
+    }
+
+    public JsonNode getBelief(String key) {
+        return beliefs.get(key);
+    }
+    public Map<String, Object> getBeliefsSnapshot() {
+        return new HashMap<>(beliefs);
+    }
+    private String beliefsToJson() {
+        StringBuilder sb = new StringBuilder("{");
+        boolean first = true;
+        for (Map.Entry<String, JsonNode> entry : beliefs.entrySet()) {
+            if (!first) sb.append(",");
+            first = false;
+            sb.append("\"").append(escape(entry.getKey())).append("\":").append(entry.getValue().toString());
+        }
+        sb.append("}");
+        return sb.toString();
+    }
     public String getUuid() {
         return uuid.toString();
     }
@@ -68,6 +106,7 @@ public class Activity {
           .append("\"uuid\":\"").append(uuid).append("\",")
           .append("\"goal\":\"").append(escape(goal)).append("\",")
           .append("\"status\":\"").append(status).append("\",")
+            .append("\"variables\":").append(beliefsToJson()).append(",")
           .append("\"history\":[");
         boolean first = true;
         for (ReasoningStep step : history) {

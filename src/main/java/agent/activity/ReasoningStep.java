@@ -1,8 +1,12 @@
 package agent.activity;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import dev.langchain4j.internal.Json;
+
 import java.time.Instant;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 public class ReasoningStep {
@@ -11,6 +15,18 @@ public class ReasoningStep {
     private final String input;
     private final String result;
     private final Map<String, Object> beliefsSnapshot;
+    private final List<JsonNode> events;
+
+    public ReasoningStep(String action, String input, String result, Map<String, Object> beliefsSnapshot, List<JsonNode> events) {
+        this.timestamp = Instant.now();
+        this.action = action;
+        this.input = input;
+        this.result = result;
+        this.beliefsSnapshot = beliefsSnapshot == null
+                ? Collections.emptyMap()
+                : Collections.unmodifiableMap(new HashMap<>(beliefsSnapshot));
+        this.events = events;
+    }
 
     public ReasoningStep(String action, String input, String result, Map<String, Object> beliefsSnapshot) {
         this.timestamp = Instant.now();
@@ -20,6 +36,7 @@ public class ReasoningStep {
         this.beliefsSnapshot = beliefsSnapshot == null
                 ? Collections.emptyMap()
                 : Collections.unmodifiableMap(new HashMap<>(beliefsSnapshot));
+        this.events = Collections.emptyList();
     }
 
     public Instant getTimestamp() {
@@ -38,6 +55,8 @@ public class ReasoningStep {
         return result;
     }
 
+    public List<JsonNode> getEvents(){ return events; }
+
     public Map<String, Object> getBeliefsSnapshot() {
         return beliefsSnapshot;
     }
@@ -49,7 +68,8 @@ public class ReasoningStep {
           .append("\"action\":\"").append(escape(action)).append("\",")
           .append("\"input\":\"").append(escape(input)).append("\",")
           .append("\"result\":\"").append(escape(result)).append("\",")
-          .append("\"beliefs\":").append(beliefsToJson())
+          .append("\"beliefs\":").append(beliefsToJson()).append(",")
+            .append("\"events\":[").append(events).append("]")
           .append("}");
         return sb.toString();
     }
