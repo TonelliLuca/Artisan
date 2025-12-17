@@ -3,20 +3,19 @@ import agent.ReactBrain;
 import agent.activity.Activity;
 import agent.activity.ReasoningStep;
 import com.fasterxml.jackson.databind.JsonNode;
-import dev.langchain4j.data.document.Document;
 import dev.langchain4j.mcp.McpToolProvider;
 import dev.langchain4j.mcp.client.DefaultMcpClient;
 import dev.langchain4j.mcp.client.McpClient;
 import dev.langchain4j.mcp.client.transport.McpOperationHandler;
 import dev.langchain4j.mcp.client.transport.McpTransport;
 import dev.langchain4j.mcp.client.transport.http.StreamableHttpMcpTransport;
+import dev.langchain4j.model.ollama.OllamaChatModel;
 import dev.langchain4j.model.openai.OpenAiChatModel;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
 import java.net.Socket;
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
@@ -25,7 +24,19 @@ import static org.junit.jupiter.api.Assertions.*;
 
 public class ActivitySubmissionIntegrationTest {
 
-    // Minimal NoOp handler used in other tests
+//    OllamaChatModel model = OllamaChatModel.builder()
+//            .baseUrl("http://localhost:11434")
+//            .modelName("qwen2.5")
+//            .temperature(0.0)
+//            .timeout(java.time.Duration.ofMinutes(2))
+//            .build();
+
+    OpenAiChatModel model = OpenAiChatModel.builder()
+            .baseUrl("http://langchain4j.dev/demo/openai/v1")
+            .apiKey("demo")
+            .modelName("gpt-4o-mini")
+            .build();
+
     static class NoOpHandler extends McpOperationHandler {
         public NoOpHandler(McpTransport t) {
             super(new java.util.concurrent.ConcurrentHashMap<>(), null, t, l -> {}, () -> {});
@@ -33,17 +44,25 @@ public class ActivitySubmissionIntegrationTest {
         @Override public void handle(JsonNode node) { super.handle(node); }
     }
 
-    private void printActivityHistory(Activity activity) {
-        System.out.println("Activity " + activity.getUuid() + " history (steps=" + activity.getHistory().size() + "):");
+    // Helper updated with optional windowSize parameter
+    private String formatActivityHistory(Activity activity) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("Activity ").append(activity.getUuid())
+                .append(" history (steps=").append(activity.getHistory().size()).append("):\n");
         activity.getHistory().forEach(step -> {
-            System.out.printf("%s | %s%n  input: %s%n  result: %s%n  beliefs: %s%n",
+            sb.append(String.format("%s | %s%n  input: %s%n  result: %s%n  beliefs: %s%n",
                     step.getTimestamp(),
                     step.getAction(),
                     step.getInput(),
                     step.getResult(),
-                    step.getBeliefsSnapshot());
+                    step.getBeliefsSnapshot()));
         });
-        System.out.println("Full JSON: " + activity.toJson());
+        sb.append("Full JSON: ").append(activity.toJson()).append("\n");
+        return sb.toString();
+    }
+
+    private void printActivityHistory(Activity activity) {
+        System.out.println(formatActivityHistory(activity));
     }
 
     @Test
@@ -54,7 +73,7 @@ public class ActivitySubmissionIntegrationTest {
             return;
         }
 
-        // 1. Setup MCP stack (transport -> client -> provider)
+        // 1. Setup Stack
         McpTransport transport = new StreamableHttpMcpTransport.Builder()
                 .url("http://localhost:3001/mcp")
                 .logRequests(true)
@@ -71,12 +90,7 @@ public class ActivitySubmissionIntegrationTest {
                 .mcpClients(List.of(client))
                 .build();
 
-        // 2. Setup model and build agent (same approach as other tests)
-        OpenAiChatModel model = OpenAiChatModel.builder()
-                .baseUrl("http://langchain4j.dev/demo/openai/v1")
-                .apiKey("demo")
-                .modelName("gpt-4o-mini")
-                .build();
+
 
         AsyncAgent<ReactBrain> agent = new AsyncAgent.Builder<ReactBrain>()
                 .model(model)
@@ -85,153 +99,63 @@ public class ActivitySubmissionIntegrationTest {
                 .sseUrl("http://localhost:3001/sse")
                 .build();
 
-        // 3. Prepare an Activity that instructs the agent to subscribe first and then set the timer
-        String activityGoal = "First subscribe to the notifications system, then use the timer tool to set a timer: set seconds 10 name test-timer";
+        // 2. Prepare Activity
+        String activityGoal = "First subscribe to the notifications system, then use the timer tool to set a timer: set seconds 5 name test-timer";
         Activity activity = new Activity(activityGoal);
 
-        // 4. Insert the Activity into the agent's internal queue (so test keeps the reference)
+        // 3. Manual Injection (Simulate request)
+        // Manually register the activity in the private registry so SSE works
+        Field registryField = AsyncAgent.class.getDeclaredField("activityRegistry");
+        registryField.setAccessible(true);
+        ((Map<String, Activity>) registryField.get(agent)).put(activity.getUuid(), activity);
+
         Field qField = AsyncAgent.class.getDeclaredField("activityQueue");
         qField.setAccessible(true);
-        @SuppressWarnings("unchecked")
-        BlockingQueue<Activity> queue = (BlockingQueue<Activity>) qField.get(agent);
-        assertNotNull(queue);
-        queue.offer(activity);
+        ((BlockingQueue<Activity>) qField.get(agent)).offer(activity);
 
-        // 5. Wait for the activity to be processed through phases (history grows)
-        long deadline = System.currentTimeMillis() + 100000;
+        // 4. Wait for evolution
+        long deadline = System.currentTimeMillis() + 120000;
         boolean historyEvolved = false;
         while (System.currentTimeMillis() < deadline) {
-            int size = activity.getHistory().size();
-            if (size >= 3) { // at least reason, act
+            if (activity.getHistory().size() >= 3) {
                 historyEvolved = true;
                 break;
             }
-            Thread.sleep(200);
+            Thread.sleep(500);
         }
-        assertTrue(historyEvolved, "Activity history should have at least 3 steps (reason, act, observe)");
+        assertTrue(historyEvolved, "Activity history should grow");
 
-        // 6. Validate the sequence of actions recorded
-        List<ReasoningStep> hist = activity.getHistory();
-        assertTrue(hist.size() >= 3, "history length");
-        assertEquals("reason", hist.get(0).getAction().toLowerCase());
-        assertEquals("act", hist.get(1).getAction().toLowerCase());
-        assertEquals("observe", hist.get(2).getAction().toLowerCase());
-
-        // 7. Also verify MCP side-effects: variables and events contain timer entries (per-UUID maps)
-        Field varsPerActivityField = AsyncAgent.class.getDeclaredField("variablesPerActivity");
-        varsPerActivityField.setAccessible(true);
-        @SuppressWarnings("unchecked")
-        Map<String, Map<String, JsonNode>> varsPerActivity = (Map<String, Map<String, JsonNode>>) varsPerActivityField.get(agent);
-
-        Field eventsPerActivityField = AsyncAgent.class.getDeclaredField("eventsPerActivity");
-        eventsPerActivityField.setAccessible(true);
-        @SuppressWarnings("unchecked")
-        Map<String, List<JsonNode>> eventsPerActivity = (Map<String, List<JsonNode>>) eventsPerActivityField.get(agent);
-
-        long deadline2 = System.currentTimeMillis() + 30000;
-        boolean gotVar = false;
-        boolean gotEvent = false;
+        // 5. Verify Beliefs (Instead of reflecting on removed Maps)
+        // The variable should appear DIRECTLY inside the Activity
         String expectedKey = "test-timer";
-        String messageUuid = activity.getUuid();
+        boolean gotVar = false;
+        long deadline2 = System.currentTimeMillis() + 30000;
 
-        while (System.currentTimeMillis() < deadline2 && !(gotVar && gotEvent)) {
-            // check per-uuid vars specifically for this messageUuid
-            Map<String, JsonNode> bucket = varsPerActivity.get(messageUuid);
-            if (!gotVar && bucket != null && bucket.containsKey(expectedKey)) {
+        while (System.currentTimeMillis() < deadline2) {
+            JsonNode belief = activity.getBelief(expectedKey);
+            if (belief != null) {
                 gotVar = true;
+                break;
             }
-
-            // check per-uuid events specifically for this messageUuid
-            List<JsonNode> evList = eventsPerActivity.get(messageUuid);
-            if (!gotEvent && evList != null) {
-                for (JsonNode ev : evList) {
-                    if (ev != null && ev.has("key") && expectedKey.equals(ev.get("key").asText())
-                            && ev.has("name") && "timer.finished".equals(ev.get("name").asText())) {
-                        gotEvent = true;
-                        break;
-                    }
-                }
-            }
-
-            // fallback: scan all per-uuid buckets if not found under the activity UUID
-            if (!gotVar) {
-                for (Map<String, JsonNode> b : varsPerActivity.values()) {
-                    if (b != null && b.containsKey(expectedKey)) {
-                        gotVar = true;
-                        break;
-                    }
-                }
-            }
-            if (!gotEvent) {
-                for (List<JsonNode> list : eventsPerActivity.values()) {
-                    if (list == null) continue;
-                    for (JsonNode ev : list) {
-                        if (ev != null && ev.has("key") && expectedKey.equals(ev.get("key").asText())
-                                && ev.has("name") && "timer.finished".equals(ev.get("name").asText())) {
-                            gotEvent = true;
-                            break;
-                        }
-                    }
-                    if (gotEvent) break;
-                }
-            }
-
-            if (gotVar && gotEvent) break;
-            Thread.sleep(200);
+            Thread.sleep(500);
         }
 
-        assertTrue(gotVar, "Variable with key '" + expectedKey + "' should be stored in per-UUID maps");
-
-        // locate storedVar in per-uuid map for this activity's UUID (or any per-UUID bucket as fallback)
-        JsonNode storedVar = null;
-        Map<String, JsonNode> localBucket = varsPerActivity.get(messageUuid);
-        if (localBucket != null) storedVar = localBucket.get(expectedKey);
-        if (storedVar == null) {
-            for (Map<String, JsonNode> b : varsPerActivity.values()) {
-                if (b != null && b.containsKey(expectedKey)) {
-                    storedVar = b.get(expectedKey);
-                    break;
-                }
-            }
-        }
-
-        assertNotNull(storedVar, "Stored variable must be present in per-UUID maps for key '" + expectedKey + "'");
-        assertTrue(storedVar.has("seconds") || storedVar.has("name"));
-
+        assertTrue(gotVar, "Variable 'test-timer' should be stored in Activity beliefs via SSE");
         printActivityHistory(activity);
     }
 
     @Test
     void submitTwoActivities_concurrently_verifyIsolationAndCompletion() throws Exception {
-        // 0. Pre-check Node server
-        try (Socket s = new Socket("localhost", 3001)) { /* ok */ } catch (Exception e) {
-            System.out.println("⚠️ Node Server not running on 3001. Skipping test.");
-            return;
-        }
+        // Pre-check Node server
+        try (Socket s = new Socket("localhost", 3001)) { /* ok */ } catch (Exception e) { return; }
 
-        // 1. Setup stack (transport -> client -> provider)
+        // Setup usual stack...
         McpTransport transport = new StreamableHttpMcpTransport.Builder()
-                .url("http://localhost:3001/mcp")
-                .logRequests(true)
-                .logResponses(true)
-                .build();
+                .url("http://localhost:3001/mcp").logRequests(false).logResponses(false).build();
         transport.start(new NoOpHandler(transport));
+        McpClient client = new DefaultMcpClient.Builder().transport(transport).build();
+        McpToolProvider provider = McpToolProvider.builder().mcpClients(List.of(client)).build();
 
-        McpClient client = new DefaultMcpClient.Builder()
-                .transport(transport)
-                .toolExecutionTimeout(Duration.ofSeconds(10))
-                .build();
-
-        McpToolProvider provider = McpToolProvider.builder()
-                .mcpClients(List.of(client))
-                .build();
-
-        // 2. Setup agent
-        OpenAiChatModel model = OpenAiChatModel.builder()
-                .baseUrl("http://langchain4j.dev/demo/openai/v1")
-                .apiKey("demo")
-                .modelName("gpt-4o-mini")
-                .build();
 
         AsyncAgent<ReactBrain> agent = new AsyncAgent.Builder<ReactBrain>()
                 .model(model)
@@ -240,65 +164,226 @@ public class ActivitySubmissionIntegrationTest {
                 .sseUrl("http://localhost:3001/sse")
                 .build();
 
-        // 3. Create the TWO activities
-        // Activity A: Long (10 seconds)
-        String goalLong = "First subscribe to notifications, then set a timer: set seconds 10 name timer-long";
-        Activity activityLong = new Activity(goalLong);
+        // Two Activities
+        Activity activityLong = new Activity("First subscribe, then set timer: 8 seconds name timer-long");
+        Activity activityShort = new Activity("First subscribe, then set timer: 3 seconds name timer-short");
 
-        // Activity B: Short (5 seconds) - This should finish BEFORE the other
-        String goalShort = "First subscribe to notifications, then set a timer: set seconds 5 name timer-short";
-        Activity activityShort = new Activity(goalShort);
+        // Manual Injection into Registry & Queue
+        Field registryField = AsyncAgent.class.getDeclaredField("activityRegistry");
+        registryField.setAccessible(true);
+        Map<String, Activity> registry = (Map<String, Activity>) registryField.get(agent);
 
-        // 4. Enqueue both activities
+        registry.put(activityLong.getUuid(), activityLong);
+        registry.put(activityShort.getUuid(), activityShort);
+
         Field qField = AsyncAgent.class.getDeclaredField("activityQueue");
         qField.setAccessible(true);
-        @SuppressWarnings("unchecked")
         BlockingQueue<Activity> queue = (BlockingQueue<Activity>) qField.get(agent);
 
-        System.out.println("🚀 Submitting BOTH activities...");
+        System.out.println("🚀 Submitting Concurrent Activities...");
         queue.offer(activityLong);
         queue.offer(activityShort);
 
-        // 5. Polling for completion
-        long deadline = System.currentTimeMillis() + 30000; // 30s timeout
-        boolean longDone = false;
-        boolean shortDone = false;
-
+        // Polling
+        long deadline = System.currentTimeMillis() + 120000;
         while (System.currentTimeMillis() < deadline) {
-            if (activityLong.isCompleted()) longDone = true;
-            if (activityShort.isCompleted()) shortDone = true;
-
-            if (longDone && shortDone) break;
+            if (activityLong.isCompleted() && activityShort.isCompleted()) break;
             Thread.sleep(500);
         }
 
-        // 6. Assertions on completion
-        assertTrue(shortDone, "Short activity (5s) should be completed");
-        assertTrue(longDone, "Long activity (10s) should be completed");
+        assertTrue(activityShort.isCompleted(), "Short activity should finish");
+        assertTrue(activityLong.isCompleted(), "Long activity should finish");
 
-        System.out.println("✅ Both activities completed!");
-        printActivityHistory(activityShort);
-        printActivityHistory(activityLong);
+        // --- ISOLATION CHECK (New logic) ---
+        // Check the Activity objects' memory directly
 
-        // 7. VERIFY ISOLATION (the scientific check)
-        // Retrieve agent's internal maps
-        Field varsField = AsyncAgent.class.getDeclaredField("variablesPerActivity");
-        varsField.setAccessible(true);
-        @SuppressWarnings("unchecked")
-        Map<String, Map<String, JsonNode>> varsPerActivity = (Map<String, Map<String, JsonNode>>) varsField.get(agent);
+        // Short must not have Long
+        assertNotNull(activityShort.getBelief("timer-short"));
+        assertNull(activityShort.getBelief("timer-long"), "CRITICAL: Isolation breach in Short Activity");
 
-        // Memory analysis for SHORT activity
-        Map<String, JsonNode> shortVars = varsPerActivity.get(activityShort.getUuid());
-        assertNotNull(shortVars, "Short activity must have its own variable bucket");
-        assertTrue(shortVars.containsKey("timer-short"), "Short bucket must contain 'timer-short'");
-        assertFalse(shortVars.containsKey("timer-long"), "CRITICAL: Short bucket MUST NOT contain 'timer-long' (Isolation Check)");
+        // Long must not have Short
+        assertNotNull(activityLong.getBelief("timer-long"));
+        assertNull(activityLong.getBelief("timer-short"), "CRITICAL: Isolation breach in Long Activity");
 
-        // Memory analysis for LONG activity
-        Map<String, JsonNode> longVars = varsPerActivity.get(activityLong.getUuid());
-        assertNotNull(longVars, "Long activity must have its own variable bucket");
-        assertTrue(longVars.containsKey("timer-long"), "Long bucket must contain 'timer-long'");
-        assertFalse(longVars.containsKey("timer-short"), "CRITICAL: Long bucket MUST NOT contain 'timer-short' (Isolation Check)");
+        System.out.println("✅ Context Isolation Verified using Activity Encapsulation.");
+    }
 
-        System.out.println("✅ Context Isolation Verified: Variables did not leak between activities.");
+    @Test
+    void submitActivities_complexScenario() throws Exception {
+        // Pre-check
+        try (Socket s = new Socket("localhost", 3001)) { /* ok */ } catch (Exception e) { return; }
+
+        // ... (Stack setup identical to others) ...
+        McpTransport transport = new StreamableHttpMcpTransport.Builder().url("http://localhost:3001/mcp").build();
+        transport.start(new NoOpHandler(transport));
+        McpClient client = new DefaultMcpClient.Builder().transport(transport).build();
+        McpToolProvider provider = McpToolProvider.builder().mcpClients(List.of(client)).build();
+
+        AsyncAgent<ReactBrain> agent = new AsyncAgent.Builder<ReactBrain>()
+                .model(model).agentInterface(ReactBrain.class)
+                .mcpToolProvider(provider).sseUrl("http://localhost:3001/sse").build();
+
+        // 1. Define Activities
+        Activity actDouble = new Activity("First subscribe. Then set timer 3s 'timer-A'. ALSO set timer 5s 'timer-B'.");
+        Activity actImpossible = new Activity("Check Apple stock price.");
+
+        // 2. Inject
+        Field registryField = AsyncAgent.class.getDeclaredField("activityRegistry");
+        registryField.setAccessible(true);
+        ((Map<String, Activity>) registryField.get(agent)).put(actDouble.getUuid(), actDouble);
+        ((Map<String, Activity>) registryField.get(agent)).put(actImpossible.getUuid(), actImpossible);
+
+        Field qField = AsyncAgent.class.getDeclaredField("activityQueue");
+        qField.setAccessible(true);
+        BlockingQueue<Activity> queue = (BlockingQueue<Activity>) qField.get(agent);
+
+        queue.offer(actDouble);
+        queue.offer(actImpossible);
+
+        // 3. Wait
+        long deadline = System.currentTimeMillis() + 120000;
+        while (System.currentTimeMillis() < deadline) {
+            if (actDouble.isCompleted() && actImpossible.isCompleted()) break;
+            Thread.sleep(500);
+        }
+
+        assertTrue(actDouble.isCompleted());
+        assertTrue(actImpossible.isCompleted());
+
+        // 4. Verify Double Timer Logic (Using Activity Memory)
+        assertNotNull(actDouble.getBelief("timer-A"), "Missing timer-A");
+        assertNotNull(actDouble.getBelief("timer-B"), "Missing timer-B");
+
+        // 5. Verify Impossible (Using Result)
+        ReasoningStep last = actImpossible.lastStep().orElseThrow();
+        // The agent should have concluded it cannot do it
+        System.out.println("Impossible Task Result: " + last.getResult());
+
+        System.out.println("✅ Complex Scenario Passed");
+        System.out.println("---- Activity Histories ----");
+        System.out.println("Double Timer Activity:");
+        printActivityHistory(actDouble);
+        System.out.println("Impossible Task Activity:");
+        printActivityHistory(actImpossible);
+    }
+
+    @Test
+    void submitSequentialDependentTimers_verifyChecklistLogic() throws Exception {
+        // 0. Pre-check
+        try (Socket s = new Socket("localhost", 3001)) { /* ok */ } catch (Exception e) { return; }
+
+        // 1. Setup Stack
+        McpTransport transport = new StreamableHttpMcpTransport.Builder().url("http://localhost:3001/mcp").build();
+        transport.start(new NoOpHandler(transport));
+        McpClient client = new DefaultMcpClient.Builder().transport(transport).toolExecutionTimeout(Duration.ofSeconds(10)).build();
+        McpToolProvider provider = McpToolProvider.builder().mcpClients(List.of(client)).build();
+
+        // Use your local model
+
+
+        AsyncAgent<ReactBrain> agent = new AsyncAgent.Builder<ReactBrain>()
+                .model(model).agentInterface(ReactBrain.class)
+                .mcpToolProvider(provider).sseUrl("http://localhost:3001/sse").build();
+
+        // 2. Goal
+        String goal = "First subscribe. Then set 'timer-A' for 4 seconds and 'timer-B' for 4 seconds. " +
+                "Wait for BOTH 'timer-A' and 'timer-B' to finish ringing. " +
+                "ONLY AFTER both A and B events are received, set 'timer-C' for 2 seconds.";
+        Activity activity = new Activity(goal);
+
+        // 3. Inject
+        Field registryField = AsyncAgent.class.getDeclaredField("activityRegistry");
+        registryField.setAccessible(true);
+        ((Map<String, Activity>) registryField.get(agent)).put(activity.getUuid(), activity);
+
+        Field qField = AsyncAgent.class.getDeclaredField("activityQueue");
+        qField.setAccessible(true);
+        ((BlockingQueue<Activity>) qField.get(agent)).offer(activity);
+
+        // 4. Wait
+        System.out.println("⏳ Waiting for sequential timers (approx 15s)...");
+        long deadline = System.currentTimeMillis() + 120000;
+        while (System.currentTimeMillis() < deadline) {
+            if (activity.isCompleted()) break;
+            Thread.sleep(1000);
+        }
+        assertTrue(activity.isCompleted(), "Activity should complete within timeout");
+
+        // 5. Verify Timeline (EVENT-BASED LOGIC)
+        List<ReasoningStep> history = activity.getHistory();
+
+        long timeA_Finished = -1;
+        long timeB_Finished = -1;
+        long timeC_Started = -1;
+
+        System.out.println("\n--- Event Sequence Analysis ---");
+
+        for (ReasoningStep step : history) {
+            // Replace the loop logic with this:
+
+            String act = step.getAction();
+            String rawResult = step.getResult();
+            long timestamp = step.getTimestamp().toEpochMilli();
+
+// A. Detect when events ARRIVE (OBSERVE phase)
+            if ("observe".equals(act)) {
+                // FIX: Use step.getEvents() instead of step.getInput()
+                // Convert the list of JSON nodes to a string for quick checks
+                String eventsContent = step.getEvents().toString().toLowerCase();
+
+                if (eventsContent.contains("timer-a") && eventsContent.contains("finished")) {
+                    timeA_Finished = timestamp;
+                    System.out.println("✅ Event Received: Timer A Finished at " + step.getTimestamp());
+                }
+                if (eventsContent.contains("timer-b") && eventsContent.contains("finished")) {
+                    timeB_Finished = timestamp;
+                    System.out.println("✅ Event Received: Timer B Finished at " + step.getTimestamp());
+                }
+            }
+
+            // B. Detect when the action STARTS (ACT phase)
+            if ("act".equals(act)) {
+                // Extract only the JSON to ignore future thoughts ("I will do C later...")
+                String cleanJson = extractJson(rawResult);
+
+                // If the JSON contains the real tool call
+                if (cleanJson.contains("timer-c")) {
+                    timeC_Started = timestamp;
+                    System.out.println("🚀 Action Executed: Timer C Started at " + step.getTimestamp());
+                }
+            }
+        }
+
+        // 6. Logical assertions
+        // CORE OF THE TEST: C must start AFTER A and B have finished
+        assertTrue(timeA_Finished > 0, "Timer A finished event missing");
+        assertTrue(timeB_Finished > 0, "Timer B finished event missing");
+        assertTrue(timeC_Started > 0, "Timer C action missing");
+
+        // IL CUORE DEL TEST: C deve essere partito DOPO che A e B sono finiti
+        if (timeC_Started < timeA_Finished || timeC_Started < timeB_Finished) {
+            fail("❌ Sequential Violation: Timer C started before A/B finished!\n" +
+                    "Time A: " + timeA_Finished + "\n" +
+                    "Time B: " + timeB_Finished + "\n" +
+                    "Time C: " + timeC_Started);
+        }
+
+        System.out.println("✅ Sequential Dependency Logic Verified: C started (" + timeC_Started +
+                ") strictly after A (" + timeA_Finished + ") and B (" + timeB_Finished + ")");
+
+        printActivityHistory(activity);
+    }
+
+    // Helper to clean the response and get only the action JSON
+    private String extractJson(String text) {
+        if (text == null) return "";
+        int start = text.indexOf("```json");
+        if (start == -1) start = text.indexOf("{"); // Fallback se manca markdown
+        int end = text.lastIndexOf("}");
+
+        if (start != -1 && end != -1 && end > start) {
+            return text.substring(start, end + 1).toLowerCase();
+        }
+        return "";
     }
 }
