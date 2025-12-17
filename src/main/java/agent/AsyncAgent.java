@@ -5,10 +5,13 @@ import agent.activity.ReasoningStep;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.NullNode;
+import com.fasterxml.jackson.databind.node.TextNode;
 import dev.langchain4j.agentic.AgenticServices;
 import dev.langchain4j.data.document.Document;
 import dev.langchain4j.mcp.McpToolProvider;
+import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.embedding.onnx.allminilml6v2.AllMiniLmL6V2EmbeddingModel;
+import dev.langchain4j.model.ollama.OllamaChatModel;
 import dev.langchain4j.model.openai.OpenAiChatModel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -19,19 +22,12 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.UUID;
+import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.CopyOnWriteArrayList;
 
 public class AsyncAgent<T extends ReactBrain> {
-    private final OpenAiChatModel model;
+    private final ChatModel model;
     private final Class<T> agentInterface;
     private final T agentBrain;
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
@@ -40,9 +36,7 @@ public class AsyncAgent<T extends ReactBrain> {
     private final Logger logger = LoggerFactory.getLogger(AsyncAgent.class);
 
     private final ObjectMapper objectMapper = new ObjectMapper();
-    private final Map<String, Map<String, JsonNode>> variablesPerActivity = new ConcurrentHashMap<>();
-    private final Map<String, List<JsonNode>> eventsPerActivity = new ConcurrentHashMap<>();
-    private final Map<String, Activity> pendingActivities = new ConcurrentHashMap<>();
+    private final Map<String, Activity> activityRegistry = new ConcurrentHashMap<>();
 
     private final String sseUrl;
 
@@ -52,6 +46,7 @@ public class AsyncAgent<T extends ReactBrain> {
     private static final int WINDOW_SIZE = 5;
 
     private AsyncAgent(Builder<T> builder) {
+
         this.model = builder.model;
         this.agentInterface = builder.agentInterface;
         this.sseUrl = builder.sseUrl;
@@ -72,23 +67,20 @@ public class AsyncAgent<T extends ReactBrain> {
 
         this.agentBrain = agent.build();
 
-        // start SSE listener if provided
         if (this.sseUrl != null && !this.sseUrl.isEmpty()) {
             startSseListener();
         }
 
-        // start event loop
         executor.submit(this::eventLoop);
     }
 
-    // Enqueue a new activity (goal = request)
     public void request(String request) {
         if (request == null || request.isBlank()) return;
         Activity activity = new Activity(request);
+        activityRegistry.put(activity.getUuid(), activity);
         activityQueue.offer(activity);
         logger.info("Queued Activity {} (goal={})", activity.getUuid(), request);
     }
-
 
     private void eventLoop() {
         logger.info("🚦 Agent event loop started");
@@ -96,7 +88,9 @@ public class AsyncAgent<T extends ReactBrain> {
             try {
                 Activity activity = activityQueue.poll(500, TimeUnit.MILLISECONDS);
                 if (activity == null) continue;
+
                 if (activity.isCompleted()) {
+                    activityRegistry.remove(activity.getUuid());
                     logger.debug("Skipping completed activity {}", activity.getUuid());
                     continue;
                 }
@@ -104,40 +98,52 @@ public class AsyncAgent<T extends ReactBrain> {
                 String phase = status == null ? "UNKNOWN" : status.name();
                 logger.debug("Processing activity {} phase={}", activity.getUuid(), phase);
 
-                // prepare lastStep and context payloads expected by ReactBrain methods
                 String history = this.extractActivityHistory(activity, WINDOW_SIZE);
-                // compute activityUuid early so snapshots can be tied to the correct activity
-                String activityUuid = activity.getUuid().toString();
+                String activityUuid = activity.getUuid();
                 String contextJson;
                 try {
                     Map<String, Object> ctx = new HashMap<>();
-                    // include the activity UUID so tools can correlate calls; also provide a per-activity variables/events window
                     ctx.put("activityUuid", activityUuid);
-                    ctx.put("variables", snapshotVariables(activityUuid)); // variables scoped to this activity
-                    ctx.put("events", eventsPerActivity.getOrDefault(activityUuid, Collections.emptyList()));
+                    ctx.put("variables", activity.getBeliefsSnapshot());
                     contextJson = objectMapper.writeValueAsString(ctx);
                 } catch (Exception e) {
-                    logger.debug("Failed to serialize context, using empty context", e);
+                    logger.debug("Failed to serialize context", e);
                     contextJson = "";
+                }
+
+                // ---  PROGRESS TRACKER EXTRACTION ---
+                String progressTracker = "(No plan yet. Create one in Observation phase.)";
+                JsonNode progressNode = activity.getBelief("goal_progress");
+                if (progressNode != null && !progressNode.isNull()) {
+                    progressTracker = progressNode.asText();
                 }
 
                 switch (status) {
                     case REASONING -> {
-                        String reasoningResult = invokeAgentMethod("reason", activity.getGoal(), history, contextJson);
-                        Map<String, Object> snapshot = snapshotVariables(activityUuid);
+                        if (activity.hasEvents()) {
+                            logger.info("⚡ Events pending for Activity {} in REASONING phase. Skipping to OBSERVATION.", activityUuid);
+                            activity.setStatus(Activity.Status.OBSERVATION);
+                            activityQueue.offer(activity);
+                            break;
+                        }
+                        String reasoningResult = invokeAgentMethod("reason", activity.getGoal(), history, contextJson, progressTracker);
+
+                        Map<String, Object> snapshot = activity.getBeliefsSnapshot();
                         activity.addStep(new ReasoningStep("reason", activity.getGoal(), reasoningResult, snapshot));
+
                         activity.setStatus(Activity.Status.ACTION);
                         logger.info("Activity {} moved to ACTION", activity.getUuid());
                         activityQueue.offer(activity);
                     }
                     case ACTION -> {
-                        List<JsonNode> currentEvents = eventsPerActivity.get(activityUuid);
-                        int initialEventCount = (currentEvents == null) ? 0 : currentEvents.size();
-                        String actionResultJson = invokeAgentMethod("act", activity.getGoal(), history, contextJson);
+
+                        String actionResultJson = invokeAgentMethod("act", activity.getGoal(), history, contextJson, progressTracker);
                         logger.info("🛠️ Action Result: {}", actionResultJson);
+
                         String toolName = null;
                         try {
-                            JsonNode node = objectMapper.readTree(actionResultJson);
+                            String cleanAction = cleanJson(actionResultJson);
+                            JsonNode node = objectMapper.readTree(cleanAction);
                             if (node.has("tool_name") && !node.get("tool_name").isNull()) {
                                 toolName = node.get("tool_name").asText();
                             }
@@ -145,44 +151,27 @@ public class AsyncAgent<T extends ReactBrain> {
                             logger.warn("⚠️ Invalid JSON in ACT response: {}", actionResultJson);
                         }
 
-                        Map<String, Object> snapshot = snapshotVariables(activityUuid);
+                        Map<String, Object> snapshot = activity.getBeliefsSnapshot();
                         activity.addStep(new ReasoningStep("act", activity.getGoal(), actionResultJson, snapshot));
 
                         if (toolName != null && !toolName.isEmpty() && !toolName.equalsIgnoreCase("null")) {
-
                             logger.info("🛠️ Tool Call Detected: '{}'. Checking for immediate events...", toolName);
-
-                            // Check if events arrived WHILE the LLM was thinking/acting
-                            List<JsonNode> updatedEvents = eventsPerActivity.get(activityUuid);
-                            int newEventCount = (updatedEvents == null) ? 0 : updatedEvents.size();
-
-                            if (newEventCount > initialEventCount) {
-
-                                // Race condition handled: event arrived while we were busy.
+                            if (activity.hasEvents()) {
                                 logger.info("⚡ Event arrived DURING action execution! Skipping suspension for Activity {}.", activityUuid);
-
-                                // Do not suspend — go directly to OBSERVATION to process the already-arrived event
                                 activity.setStatus(Activity.Status.OBSERVATION);
                                 activityQueue.offer(activity);
-
                             } else {
-                                // Normal case: no new event, suspend and wait
                                 logger.info("💤 Suspending Activity {} (Waiting for future event)", activityUuid);
                                 activity.setStatus(Activity.Status.WAITING_FOR_EVENT);
-                                pendingActivities.put(activityUuid, activity);
                             }
-
                         } else {
-
                             logger.info("⏩ No Tool Call. Proceeding to OBSERVE immediately.");
-
                             activity.setStatus(Activity.Status.OBSERVATION);
                             activityQueue.offer(activity);
                         }
                     }
                     case OBSERVATION -> {
-                        // 1. Serialize the Java list to JSON string for the LLM
-                        List<JsonNode> eventsList = eventsPerActivity.getOrDefault(activityUuid, Collections.emptyList());
+                        List<JsonNode> eventsList = activity.consumeEvents();
                         String eventsJson = "[]";
                         try {
                             eventsJson = objectMapper.writeValueAsString(eventsList);
@@ -191,19 +180,36 @@ public class AsyncAgent<T extends ReactBrain> {
                         }
                         logger.debug("Serialized events for activity {}: {}", activityUuid, eventsJson);
 
-                        // 2. Invoke: pass 'eventsJson' (String) instead of the list
-                        String obsResult = invokeAgentMethod("observe", activity.getGoal(), history, contextJson, eventsJson);
+                        String obsResult = invokeAgentMethod("observe", activity.getGoal(), history, contextJson, eventsJson, progressTracker);
 
-                        Map<String, Object> snapshot = snapshotVariables(activityUuid);
-                        activity.addStep(new ReasoningStep("observe", activity.getGoal(), obsResult, snapshot));
+                        // --- 2. UPDATE PROGRESS & VARIABLES ---
+                        try {
+                            String cleanObs = cleanJson(obsResult);
+                            JsonNode obsNode = objectMapper.readTree(cleanObs);
 
-                        // 3. Consume: clear read events to avoid reprocessing on next loop
-                        if (eventsPerActivity.containsKey(activityUuid)) {
-                            eventsPerActivity.get(activityUuid).clear();
-                            logger.debug("🧹 Cleared consumed events for activity {}", activityUuid);
-                        }
+                            // A. Update PROGRESS TRACKER
+                            if (obsNode.has("new_progress")) {
+                                String newProgress = obsNode.get("new_progress").asText();
+                                // Save as special TextNode variable
+                                activity.setBelief("goal_progress", TextNode.valueOf(newProgress));
+                                logger.info("📝 PROGRESS UPDATED for {}:\n{}", activityUuid, newProgress);
+                            }
 
-                        // Standard completion logic
+                            // B. Update other variables (technical beliefs)
+                            if (obsNode.has("update_variables") && obsNode.get("update_variables").isObject()) {
+                                JsonNode updates = obsNode.get("update_variables");
+                                updates.fields().forEachRemaining(entry -> {
+                                    activity.setBelief(entry.getKey(), entry.getValue());
+                                    logger.info("🧠 Belief Update for {}: {} -> {}", activityUuid, entry.getKey(), entry.getValue());
+                                });
+                            }
+                        } catch (Exception e) { /* ignore non-json */ }
+
+                        Map<String, Object> snapshot = activity.getBeliefsSnapshot();
+                        activity.addStep(new ReasoningStep("observe", activity.getGoal(), obsResult, snapshot, eventsList));
+
+
+
                         boolean completed = parseCompleted(obsResult);
                         if (completed) {
                             activity.setStatus(Activity.Status.COMPLETED);
@@ -231,36 +237,42 @@ public class AsyncAgent<T extends ReactBrain> {
         logger.info("🛑 Agent event loop stopped");
     }
 
+
+
+
+
     private boolean parseCompleted(String obsResult) {
-        if (obsResult == null) return false;
-        // try parse JSON: { "completed": true } or nested
+        if (obsResult == null || obsResult.isBlank()) return false;
+
         try {
-            JsonNode node = objectMapper.readTree(obsResult);
-            if (node.has("completed") && node.get("completed").isBoolean()) {
-                return node.get("completed").asBoolean();
+            String cleanObs = cleanJson(obsResult);
+            JsonNode node = objectMapper.readTree(cleanObs);
+
+            if (node.has("completed")) {
+                JsonNode completedNode = node.get("completed");
+                if (completedNode.isBoolean()) {
+                    return completedNode.asBoolean();
+                }
+                if (completedNode.isTextual()) {
+                    return Boolean.parseBoolean(completedNode.asText());
+                }
             }
-            // also accept {"result": {"completed": true}} style
-            if (node.has("result") && node.get("result").has("completed")) {
-                return node.get("result").get("completed").asBoolean(false);
+
+            if (node.has("result")) {
+                JsonNode resultNode = node.get("result");
+                if (resultNode.has("completed")) {
+                    return resultNode.get("completed").asBoolean(false);
+                }
             }
-        } catch (Exception ignored) {
-            // not JSON - fall back to text match
+
+        } catch (Exception e) {
+
+            logger.warn("⚠️ Could not parse JSON for completion check. Keeping activity alive. Response: {}", obsResult);
         }
-        String s = obsResult.trim().toLowerCase();
-        return s.contains("completed") || s.equals("done") || s.equals("success") || s.equals("goal achieved");
+
+        return false;
     }
 
-    // Snapshot variables converting JsonNode values to Object for a specific activity UUID
-    private Map<String, Object> snapshotVariables(String activityUuid) {
-        Map<String, Object> snapshot = new HashMap<>();
-        if (activityUuid == null) return snapshot;
-        Map<String, JsonNode> vars = variablesPerActivity.get(activityUuid);
-        if (vars == null) return snapshot;
-        vars.forEach((k, v) -> snapshot.put(k, v));
-        return snapshot;
-    }
-
-    // Reflectively invoke a method on the agentBrain if available: reason / act / observe
     private String invokeAgentMethod(String methodName, Object... args) {
         try {
             Method target = null;
@@ -348,9 +360,16 @@ public class AsyncAgent<T extends ReactBrain> {
                 mcpType = params.get("mcpType").asText();
             }
             String msgUuid = params.has("uuid") ? params.get("uuid").asText() : "global";
-
+            if (msgUuid == null) {
+                logger.warn("Received MCP message without UUID, ignoring: {}", params);
+                return;
+            }
+            Activity targetActivity = activityRegistry.get(msgUuid);
+            if (targetActivity == null) {
+                logger.debug("Received message for unknown or completed activity: {}", msgUuid);
+                return;
+            }
             if ("variable".equalsIgnoreCase(mcpType)) {
-                // support both "name" and "key" as the variable identifier
                 String name = null;
                 if (params.has("name")) name = params.get("name").asText();
                 else if (params.has("key")) name = params.get("key").asText();
@@ -358,10 +377,8 @@ public class AsyncAgent<T extends ReactBrain> {
 
                 JsonNode value = params.has("value") ? params.get("value") : NullNode.getInstance();
 
-                variablesPerActivity.computeIfAbsent(msgUuid, k -> new ConcurrentHashMap<>()).put(name, value);
-
-                logger.info("🔁 Variable stored/updated for uuid {}: {} -> {}", msgUuid, name, value);
-
+                targetActivity.setBelief(name, value);
+                logger.info("🔁 Belief stored in Activity {}: {} -> {}", msgUuid, name, value);
                 return;
             }
 
@@ -375,23 +392,15 @@ public class AsyncAgent<T extends ReactBrain> {
                     eventPayload = eventPayload.get("event");
                 }
 
-                if (msgUuid != null) {
-                    // 1. Store the event (memory)
-                    eventsPerActivity.computeIfAbsent(msgUuid, k -> new CopyOnWriteArrayList<>()).add(eventPayload);
-                    logger.info("📥 Event stored for uuid {}: {}", msgUuid, eventPayload);
+                targetActivity.pushEvent(eventPayload);
+                logger.info("📥 Event pushed to Activity {}: {}", msgUuid, eventPayload);
 
-                    // 2. Resume: wake up any activity waiting for this UUID
-                    Activity pending = pendingActivities.remove(msgUuid); // remove from pending map
-                    if (pending != null) {
-                        pending.setStatus(Activity.Status.OBSERVATION); // set next state
-                        activityQueue.offer(pending); // put back into the main loop
-                        logger.info("🔔 WAKING UP Activity {} -> Resumed to OBSERVATION", msgUuid);
-                    } else {
-                        // If the activity is not pending (maybe finished or running), just log
-                        logger.debug("Event received for {} but activity is not in PENDING state.", msgUuid);
-                    }
+                if (targetActivity.getStatus() == Activity.Status.WAITING_FOR_EVENT) {
+                    targetActivity.setStatus(Activity.Status.OBSERVATION);
+                    activityQueue.offer(targetActivity);
+                    logger.info("🔔 WAKING UP Activity {} -> Resumed to OBSERVATION", msgUuid);
                 } else {
-                    logger.warn("Received event without UUID, cannot route to activity: {}", eventPayload);
+                    logger.debug("Event received for {} but activity is busy ({}). Event queued inside activity.", msgUuid, targetActivity.getStatus());
                 }
                 return;
             }
@@ -401,6 +410,21 @@ public class AsyncAgent<T extends ReactBrain> {
         } catch (Exception e) {
             logger.error("Failed to handle MCP event", e);
         }
+    }
+
+    private String cleanJson(String response) {
+        if (response == null) return "{}";
+        String trimmed = response.trim();
+
+        // Remove markdown blocks ```json ... ``` or ``` ... ```
+        if (trimmed.startsWith("```")) {
+            int start = trimmed.indexOf("{");
+            int end = trimmed.lastIndexOf("}");
+            if (start != -1 && end != -1) {
+                return trimmed.substring(start, end + 1);
+            }
+        }
+        return trimmed;
     }
 
     private String extractActivityHistory(Activity activity, int windowSize) {
@@ -419,17 +443,20 @@ public class AsyncAgent<T extends ReactBrain> {
     }
 
     public static class Builder<T extends ReactBrain> {
-        private OpenAiChatModel model;
+        private ChatModel model;
         private Class<T> agentInterface;
         private Object[] tools;
         private ArrayList<Document> documents;
         private McpToolProvider mcpToolProvider;
         private String sseUrl;
 
-        public Builder<T> model(OpenAiChatModel model) {
+
+        public Builder<T> model(ChatModel model) {
             this.model = model;
             return this;
         }
+
+
 
         public Builder<T> agentInterface(Class<T> agentInterface) {
             this.agentInterface = agentInterface;
