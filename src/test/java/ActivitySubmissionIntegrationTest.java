@@ -68,7 +68,7 @@ public class ActivitySubmissionIntegrationTest {
     @Test
     void submitActivity_setsTimer_and_activityHistoryEvolves_reactiveSubscribe() throws Exception {
         // 0. Skip if local node server not running
-        try (Socket s = new Socket("localhost", 3001)) { /* ok */ } catch (Exception e) {
+        try (Socket s = new Socket("localhost", 3001)) { } catch (Exception e) {
             System.out.println("⚠️ Node Server not running on 3001. Skipping integration test.");
             return;
         }
@@ -125,7 +125,7 @@ public class ActivitySubmissionIntegrationTest {
         }
         assertTrue(historyEvolved, "Activity history should grow");
 
-        // 5. Verify Beliefs (Instead of reflecting on removed Maps)
+        // 5. Verify Beliefs
         // The variable should appear DIRECTLY inside the Activity
         String expectedKey = "test-timer";
         boolean gotVar = false;
@@ -147,7 +147,7 @@ public class ActivitySubmissionIntegrationTest {
     @Test
     void submitTwoActivities_concurrently_verifyIsolationAndCompletion() throws Exception {
         // Pre-check Node server
-        try (Socket s = new Socket("localhost", 3001)) { /* ok */ } catch (Exception e) { return; }
+        try (Socket s = new Socket("localhost", 3001)) { } catch (Exception e) { return; }
 
         // Setup usual stack...
         McpTransport transport = new StreamableHttpMcpTransport.Builder()
@@ -211,9 +211,9 @@ public class ActivitySubmissionIntegrationTest {
     @Test
     void submitActivities_complexScenario() throws Exception {
         // Pre-check
-        try (Socket s = new Socket("localhost", 3001)) { /* ok */ } catch (Exception e) { return; }
+        try (Socket s = new Socket("localhost", 3001)) { } catch (Exception e) { return; }
 
-        // ... (Stack setup identical to others) ...
+        // Stack setup
         McpTransport transport = new StreamableHttpMcpTransport.Builder().url("http://localhost:3001/mcp").build();
         transport.start(new NoOpHandler(transport));
         McpClient client = new DefaultMcpClient.Builder().transport(transport).build();
@@ -256,7 +256,6 @@ public class ActivitySubmissionIntegrationTest {
 
         // 5. Verify Impossible (Using Result)
         ReasoningStep last = actImpossible.lastStep().orElseThrow();
-        // The agent should have concluded it cannot do it
         System.out.println("Impossible Task Result: " + last.getResult());
 
         System.out.println("✅ Complex Scenario Passed");
@@ -270,7 +269,7 @@ public class ActivitySubmissionIntegrationTest {
     @Test
     void submitSequentialDependentTimers_verifyChecklistLogic() throws Exception {
         // 0. Pre-check
-        try (Socket s = new Socket("localhost", 3001)) { /* ok */ } catch (Exception e) { return; }
+        try (Socket s = new Socket("localhost", 3001)) { } catch (Exception e) { return; }
 
         // 1. Setup Stack
         McpTransport transport = new StreamableHttpMcpTransport.Builder().url("http://localhost:3001/mcp").build();
@@ -319,16 +318,13 @@ public class ActivitySubmissionIntegrationTest {
         System.out.println("\n--- Event Sequence Analysis ---");
 
         for (ReasoningStep step : history) {
-            // Replace the loop logic with this:
-
             String act = step.getAction();
             String rawResult = step.getResult();
             long timestamp = step.getTimestamp().toEpochMilli();
 
-// A. Detect when events ARRIVE (OBSERVE phase)
+            // A. Detect when events ARRIVE (OBSERVE phase)
             if ("observe".equals(act)) {
-                // FIX: Use step.getEvents() instead of step.getInput()
-                // Convert the list of JSON nodes to a string for quick checks
+                // Use step.getEvents() instead of step.getInput()
                 String eventsContent = step.getEvents().toString().toLowerCase();
 
                 if (eventsContent.contains("timer-a") && eventsContent.contains("finished")) {
@@ -343,10 +339,9 @@ public class ActivitySubmissionIntegrationTest {
 
             // B. Detect when the action STARTS (ACT phase)
             if ("act".equals(act)) {
-                // Extract only the JSON to ignore future thoughts ("I will do C later...")
+                // Extract only the JSON to ignore future thoughts
                 String cleanJson = extractJson(rawResult);
 
-                // If the JSON contains the real tool call
                 if (cleanJson.contains("timer-c")) {
                     timeC_Started = timestamp;
                     System.out.println("🚀 Action Executed: Timer C Started at " + step.getTimestamp());
@@ -360,7 +355,6 @@ public class ActivitySubmissionIntegrationTest {
         assertTrue(timeB_Finished > 0, "Timer B finished event missing");
         assertTrue(timeC_Started > 0, "Timer C action missing");
 
-        // IL CUORE DEL TEST: C deve essere partito DOPO che A e B sono finiti
         if (timeC_Started < timeA_Finished || timeC_Started < timeB_Finished) {
             fail("❌ Sequential Violation: Timer C started before A/B finished!\n" +
                     "Time A: " + timeA_Finished + "\n" +
@@ -378,7 +372,7 @@ public class ActivitySubmissionIntegrationTest {
     private String extractJson(String text) {
         if (text == null) return "";
         int start = text.indexOf("```json");
-        if (start == -1) start = text.indexOf("{"); // Fallback se manca markdown
+        if (start == -1) start = text.indexOf("{"); // Fallback if markdown is missing
         int end = text.lastIndexOf("}");
 
         if (start != -1 && end != -1 && end > start) {
@@ -386,4 +380,102 @@ public class ActivitySubmissionIntegrationTest {
         }
         return "";
     }
+
+    @Test
+    void testMemory_LearningLoop_ReflectAndRetrieve() throws Exception {
+        // Initial setup code unchanged
+        // 0. Pre-check server Node
+        try (Socket s = new Socket("localhost", 3001)) { } catch (Exception e) { return; }
+
+        // 1. Setup Stack (Standard)
+        McpTransport transport = new StreamableHttpMcpTransport.Builder().url("http://localhost:3001/mcp").build();
+        transport.start(new NoOpHandler(transport));
+        McpClient client = new DefaultMcpClient.Builder().transport(transport).build();
+        McpToolProvider provider = McpToolProvider.builder().mcpClients(List.of(client)).build();
+
+        AsyncAgent<ReactBrain> agent = new AsyncAgent.Builder<ReactBrain>()
+                .model(model)
+                .agentInterface(ReactBrain.class)
+                .mcpToolProvider(provider)
+                .sseUrl("http://localhost:3001/sse")
+                .build();
+
+        // -------------------------------------------------------
+        // PHASE 1: Learning (Task A)
+        // -------------------------------------------------------
+        String goalA = "Subscribe and set a timer for 2 seconds called 'memory-test-1'";
+        Activity taskA = new Activity(goalA);
+
+        // Inject Task A
+        Field registryField = AsyncAgent.class.getDeclaredField("activityRegistry");
+        registryField.setAccessible(true);
+        ((Map<String, Activity>) registryField.get(agent)).put(taskA.getUuid(), taskA);
+
+        Field qField = AsyncAgent.class.getDeclaredField("activityQueue");
+        qField.setAccessible(true);
+        ((BlockingQueue<Activity>) qField.get(agent)).offer(taskA);
+
+        System.out.println("🧠 PHASE 1: Executing Task A to generate memory...");
+
+        // Wait for Task A completion
+        long deadline = System.currentTimeMillis() + 60000;
+        while (System.currentTimeMillis() < deadline) {
+            if (taskA.isCompleted()) break;
+            Thread.sleep(500);
+        }
+        assertTrue(taskA.isCompleted(), "Task A should complete");
+
+        System.out.println("⏳ Waiting for memory generation (Reflection phase)...");
+
+        // Access private memory
+        Field memoryField = AsyncAgent.class.getDeclaredField("agentMemory");
+        memoryField.setAccessible(true);
+        agent.memory.AgentMemory internalMemory = (agent.memory.AgentMemory) memoryField.get(agent);
+
+        List<String> memories = new java.util.ArrayList<>();
+        long stopWaiting = System.currentTimeMillis() + 15000; // Wait up to 15 seconds for LLM
+
+        while (System.currentTimeMillis() < stopWaiting) {
+            // Search for relevant memories
+            memories = internalMemory.retrieveRelevantMemories("set a timer", 10);
+            if (!memories.isEmpty()) {
+                System.out.println("🧠 Memory found! Proceeding with assertions.");
+                break;
+            }
+            Thread.sleep(1000);
+        }
+
+        System.out.println("🔎 Inspecting Memory Store...");
+        assertFalse(memories.isEmpty(), "⚠️ Agent failed to save memory after Task A (Timeout reached)!");
+
+        System.out.println("✅ Memory Found: " + memories.get(0));
+        assertTrue(memories.get(0).contains("memory-test-1") || memories.get(0).contains("timer"),
+                "Memory content should relate to the previous task");
+
+        // -------------------------------------------------------
+        // PHASE 2: Application (Task B) - RAG Check
+        // -------------------------------------------------------
+        String goalB = "Set a timer for 2 seconds called 'memory-test-2'. Use your past knowledge.";
+        Activity taskB = new Activity(goalB);
+
+        // Inject Task B
+        ((Map<String, Activity>) registryField.get(agent)).put(taskB.getUuid(), taskB);
+        ((BlockingQueue<Activity>) qField.get(agent)).offer(taskB);
+
+        System.out.println("🧠 PHASE 2: Executing Task B (Should use RAG)...");
+
+        // Wait for Task B completion
+        deadline = System.currentTimeMillis() + 120000;
+        while (System.currentTimeMillis() < deadline) {
+            if (taskB.isCompleted()) break;
+            Thread.sleep(500);
+        }
+        assertTrue(taskB.isCompleted(), "Task B should complete using the memory");
+
+        System.out.println("✅ Memory Cycle Test Passed!");
+
+        printActivityHistory(taskA);
+        printActivityHistory(taskB);
+    }
 }
+
