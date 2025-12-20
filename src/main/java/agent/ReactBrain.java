@@ -21,7 +21,9 @@ public interface ReactBrain {
         You are the REASONING phase.
         
         MAIN GOAL: {{goal}}
-        
+        === RELEVANT PAST MEMORIES (Use these as a guide) ===
+                        {{memories}}
+        ============================================================
         === PROGRESS TRACKER (The Master Plan) ===
         {{progress}}
         ==========================================
@@ -30,9 +32,11 @@ public interface ReactBrain {
         CURRENT CONTEXT (Variables): {{context}}
 
         YOUR TASK:
-        1. Look at the PROGRESS TRACKER. Identify what is marked [x] (Done) and what is [ ] (Pending).
-        2. Decide the very next step based on the first Pending item and the context, the context beliefs are very IMPORTANT.
-        3. Formulate a plan for the ACTION phase.
+        1. Check PAST MEMORIES first! Does a successful procedure exist?
+        2. IF YES: You MUST follow the procedure steps exactly, even if they seem redundant (e.g. subscribing first).
+        3. Look at the PROGRESS TRACKER. Identify what is marked [x] (Done) and what is [ ] (Pending).
+        4. Decide the very next step based on the first Pending item and the context, the context beliefs are very IMPORTANT.
+        5. Formulate a plan for the ACTION phase.
 
         IMPORTANT RULES:
         - NEVER call tools in this phase.
@@ -43,10 +47,10 @@ public interface ReactBrain {
         RECENT HISTORY (Last 5 steps):
         {{history}}
     """)
-    String reason(@V("goal")String goal, @V("history")String history, @V("context")String context, @V("progress") String progress);
+    String reason(@V("goal")String goal, @V("history")String history, @V("context")String context, @V("progress") String progress, @V("memories") String memories);
 
     @UserMessage("""
-        You are the ACTION phase.
+        You are the ACTION phase, if i ask to do a tool call you need to perform it via remote procedure call.
         
         YOUR TASK:
         Execute the next pending action using the available tools or do nothing if no tool is applicable.
@@ -103,7 +107,7 @@ public interface ReactBrain {
     
     1. INITIAL PLANNING (If Progress is empty):
        - Assess if the GOAL is achievable with the tools you likely have or general logic.
-       - IF ACHIEVABLE: Create the initial Master Plan in 'new_progress' and set each point to [ ].
+       - IF ACHIEVABLE: Create the initial Master Plan in 'new_progress' and set each point to [ ], Break down complex goals into distinct, atomic steps.
        - IF IMPOSSIBLE: Do NOT create a plan. Set "completed": true and explain why in "summary".
 
     
@@ -145,5 +149,35 @@ public interface ReactBrain {
     {{history}}
 
 """)
-    String observe(@V("goal") String goal, @V("history") String history, @V("context") String context, @V("events") String events);
+    String observe(@V("goal") String goal, @V("history") String history, @V("context") String context, @V("events") String events, @V("progress") String progress);
+
+    @UserMessage("""
+        You are the REFLECTION phase.
+        
+        TASK GOAL: {{goal}}
+        FINAL STATUS: {{status}}
+        FULL HISTORY: 
+        {{history}}
+        
+        Your job is to compress this experience into a reusable memory for future reference.
+         Analyze the history to understand what went well and what didn't.
+        
+        1. SUMMARY: Briefly describe what was done to achieve (or fail) the goal.
+        2. LESSONS: Did anything fail? How was it fixed? If it was impossible, why?
+        3. PROCEDURE: Extract the high-level steps that worked (The "Happy Path"). 
+           - Generalize specific values (e.g., instead of "set timer for 5s", use "set timer for required duration").
+           - Note any important dependencies (e.g., "Wait for X before doing Y").
+        
+        CRITICAL: Return ONLY JSON. No markdown.
+        
+        Return JSON format:
+        {
+          "summary": "Brief summary of the activity",
+          "outcome": "SUCCESS" or "FAILURE",
+          "lessons_learned": ["Lesson 1", "Lesson 2"],
+          "successful_procedure": ["Step 1", "Step 2", "Step 3"],
+          "keywords": ["keyword1", "keyword2"]
+        }
+    """)
+    String reflect(@V("goal") String goal, @V("status") String status, @V("history") String history);
 }
