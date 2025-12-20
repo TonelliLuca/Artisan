@@ -2,6 +2,8 @@ package agent;
 
 import agent.activity.Activity;
 import agent.activity.ReasoningStep;
+import agent.memory.AgentMemory;
+import agent.memory.EpisodicMemory;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.NullNode;
@@ -31,7 +33,7 @@ public class AsyncAgent<T extends ReactBrain> {
     private final Class<T> agentInterface;
     private final T agentBrain;
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
-    private final AllMiniLmL6V2EmbeddingModel embeddingModel = new AllMiniLmL6V2EmbeddingModel();
+    private final AgentMemory agentMemory;
     private final UUID agentId = UUID.randomUUID();
     private final Logger logger = LoggerFactory.getLogger(AsyncAgent.class);
 
@@ -46,7 +48,7 @@ public class AsyncAgent<T extends ReactBrain> {
     private static final int WINDOW_SIZE = 5;
 
     private AsyncAgent(Builder<T> builder) {
-
+        this.agentMemory = new AgentMemory();
         this.model = builder.model;
         this.agentInterface = builder.agentInterface;
         this.sseUrl = builder.sseUrl;
@@ -89,11 +91,6 @@ public class AsyncAgent<T extends ReactBrain> {
                 Activity activity = activityQueue.poll(500, TimeUnit.MILLISECONDS);
                 if (activity == null) continue;
 
-                if (activity.isCompleted()) {
-                    activityRegistry.remove(activity.getUuid());
-                    logger.debug("Skipping completed activity {}", activity.getUuid());
-                    continue;
-                }
                 Activity.Status status = activity.getStatus();
                 String phase = status == null ? "UNKNOWN" : status.name();
                 logger.debug("Processing activity {} phase={}", activity.getUuid(), phase);
@@ -126,7 +123,13 @@ public class AsyncAgent<T extends ReactBrain> {
                             activityQueue.offer(activity);
                             break;
                         }
-                        String reasoningResult = invokeAgentMethod("reason", activity.getGoal(), history, contextJson, progressTracker);
+                        List<String> relevantMemories = agentMemory.retrieveRelevantMemories(activity.getGoal(), 2);
+                        String memoriesText = "No relevant past memories found.";
+                        if (!relevantMemories.isEmpty()) {
+                            memoriesText = String.join("\n\n--- MEMORY ---\n", relevantMemories);
+                            logger.info("🧠 Found {} relevant memories for reasoning.", relevantMemories.size());
+                        }
+                        String reasoningResult = invokeAgentMethod("reason", activity.getGoal(), history, contextJson, progressTracker, memoriesText);
 
                         Map<String, Object> snapshot = activity.getBeliefsSnapshot();
                         activity.addStep(new ReasoningStep("reason", activity.getGoal(), reasoningResult, snapshot));
@@ -221,7 +224,43 @@ public class AsyncAgent<T extends ReactBrain> {
                         activityQueue.offer(activity);
                     }
                     case COMPLETED -> {
-                        logger.debug("Activity {} already completed", activity.getUuid());
+                        logger.info("🎉 Activity {} completed. Starting REFLECTION & MEMORY STORAGE...", activity.getUuid());
+                        String fullHistory = extractActivityHistory(activity, 100);
+                        String reflectionJson = invokeAgentMethod("reflect",
+                                activity.getGoal(),
+                                "COMPLETED",
+                                fullHistory
+                        );
+                        if (reflectionJson != null && !reflectionJson.isBlank()) {
+                            try {
+                                String cleanJson = cleanJson(reflectionJson);
+                                JsonNode memNode = objectMapper.readTree(cleanJson);
+
+
+                                String summary = memNode.has("summary") ? memNode.get("summary").asText() : "";
+                                String outcome = memNode.has("outcome") ? memNode.get("outcome").asText() : "UNKNOWN";
+
+                                List<String> procedure = new ArrayList<>();
+                                if (memNode.has("successful_procedure")) {
+                                    memNode.get("successful_procedure").forEach(n -> procedure.add(n.asText()));
+                                }
+
+                                EpisodicMemory memory = new agent.memory.EpisodicMemory(
+                                        activity.getGoal(),
+                                        outcome,
+                                        summary,
+                                        procedure
+                                );
+
+                                agentMemory.save(memory);
+
+                            } catch (Exception e) {
+                                logger.warn("Failed to save memory for activity {}", activity.getUuid(), e);
+                            }
+                        }
+
+                        activityRegistry.remove(activity.getUuid());
+
                     }
                     default -> {
                         logger.warn("Unknown activity status for {}: {}", activity.getUuid(), status);
